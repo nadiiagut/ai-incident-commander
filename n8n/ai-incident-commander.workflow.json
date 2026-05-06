@@ -1,0 +1,242 @@
+{
+  "name": "AI Incident Commander",
+  "nodes": [
+
+    {
+      "parameters": {
+        "content": "## 1 — Grafana Webhook\nReceives Grafana Unified Alerting POST on `/webhook/grafana-incident`.\nResponds immediately (202) so Grafana does not time out.\n\n**Expected payload shape:**\n```\n{\n  \"status\": \"firing\",\n  \"title\": \"[FIRING] checkout-500-error-rate\",\n  \"commonLabels\": { \"alertname\": \"...\", \"severity\": \"critical\", \"service\": \"checkout-api\" },\n  \"alerts\": [{ \"startsAt\": \"2026-05-06T14:00:00Z\" }],\n  \"dashboardURL\": \"http://grafana:3000/d/...\"\n}\n```",
+        "height": 220,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-webhook",
+      "name": "Note: Webhook",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [220, 60]
+    },
+
+    {
+      "parameters": {
+        "content": "## 2 — Normalize Alert Fields\nExtracts and normalises the 6 fields needed by the AI analyzer.\nDefaults `service` to `checkout-api` when the label is absent.",
+        "height": 120,
+        "width": 280,
+        "color": 5
+      },
+      "id": "note-set",
+      "name": "Note: Normalize",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [640, 60]
+    },
+
+    {
+      "parameters": {
+        "content": "## 3 — Analyze Incident\nPOSTs the normalised alert JSON to the AI analyzer.\n\nExpected response fields:\n- `jira_incident_title`\n- `jira_incident_description`\n- `preventive_story_title`\n- `preventive_story_description`\n- `acceptance_criteria`",
+        "height": 160,
+        "width": 280,
+        "color": 4
+      },
+      "id": "note-http",
+      "name": "Note: AI Analyzer",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [960, 60]
+    },
+
+    {
+      "parameters": {
+        "content": "## 4 & 5 — Jira Issues\n**Bug** — incident record linked to the firing alert.\n**Story** — preventive engineering work to stop recurrence.\n\nCHANGE ME: set your Jira project key and credential.",
+        "height": 120,
+        "width": 460,
+        "color": 3
+      },
+      "id": "note-jira",
+      "name": "Note: Jira",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1240, 60]
+    },
+
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "grafana-incident",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson",
+        "options": {}
+      },
+      "id": "node-webhook",
+      "name": "Grafana Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [360, 340],
+      "webhookId": "grafana-incident-webhook",
+      "notes": "Listens for Grafana Unified Alerting webhooks. Add this URL as a contact point in Grafana: POST /webhook/grafana-incident"
+    },
+
+    {
+      "parameters": {
+        "mode": "manual",
+        "duplicateItem": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "field-service",
+              "name": "service",
+              "value": "={{ $json.commonLabels?.service ?? 'checkout-api' }}",
+              "type": "string"
+            },
+            {
+              "id": "field-alert-name",
+              "name": "alert_name",
+              "value": "={{ $json.title ?? $json.commonLabels?.alertname ?? 'Unknown Alert' }}",
+              "type": "string"
+            },
+            {
+              "id": "field-severity",
+              "name": "severity",
+              "value": "={{ $json.commonLabels?.severity ?? 'unknown' }}",
+              "type": "string"
+            },
+            {
+              "id": "field-status",
+              "name": "status",
+              "value": "={{ $json.status ?? 'firing' }}",
+              "type": "string"
+            },
+            {
+              "id": "field-starts-at",
+              "name": "starts_at",
+              "value": "={{ $json.alerts?.[0]?.startsAt ?? $now.toISO() }}",
+              "type": "string"
+            },
+            {
+              "id": "field-dashboard-url",
+              "name": "dashboard_url",
+              "value": "={{ $json.dashboardURL ?? $json.externalURL ?? '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-normalize",
+      "name": "Normalize Alert Fields",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [620, 340],
+      "notes": "Extracts: service (default checkout-api), alert_name, severity, status, starts_at, dashboard_url"
+    },
+
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ai-incident-analyzer:8080/analyze-incident",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ service: $json.service, alert_name: $json.alert_name, severity: $json.severity, status: $json.status, starts_at: $json.starts_at, dashboard_url: $json.dashboard_url }) }}",
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-analyze",
+      "name": "Analyze Incident",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 340],
+      "notes": "CHANGE ME: Update URL if the AI analyzer runs on a different host/port. Returns: jira_incident_title, jira_incident_description, preventive_story_title, preventive_story_description, acceptance_criteria"
+    },
+
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": "={{ $env.JIRA_PROJECT_KEY }}",
+        "issuetype": "Bug",
+        "summary": "={{ $json.jira_incident_title }}",
+        "additionalFields": {
+          "description": "={{ $json.jira_incident_description }}"
+        }
+      },
+      "id": "node-jira-bug",
+      "name": "Create Jira Bug",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [1140, 260],
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "placeholder-jira-credential-id",
+          "name": "Jira Account"
+        }
+      },
+      "notes": "CHANGE ME: Set JIRA_PROJECT_KEY env var (e.g. OPS) and link your Jira credential. Creates a Bug to track the live incident."
+    },
+
+    {
+      "parameters": {
+        "resource": "issue",
+        "operation": "create",
+        "project": "={{ $env.JIRA_PROJECT_KEY }}",
+        "issuetype": "Story",
+        "summary": "={{ $('Analyze Incident').item.json.preventive_story_title }}",
+        "additionalFields": {
+          "description": "={{ $('Analyze Incident').item.json.preventive_story_description + '\\n\\n*Acceptance Criteria*\\n' + $('Analyze Incident').item.json.acceptance_criteria }}"
+        }
+      },
+      "id": "node-jira-story",
+      "name": "Create Preventive Story",
+      "type": "n8n-nodes-base.jira",
+      "typeVersion": 1,
+      "position": [1140, 440],
+      "credentials": {
+        "jiraSoftwareCloudApi": {
+          "id": "placeholder-jira-credential-id",
+          "name": "Jira Account"
+        }
+      },
+      "notes": "Creates a Story for preventive engineering work. Description includes AI-generated acceptance criteria from the analyzer response."
+    }
+
+  ],
+  "connections": {
+    "Grafana Webhook": {
+      "main": [
+        [
+          { "node": "Normalize Alert Fields", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Normalize Alert Fields": {
+      "main": [
+        [
+          { "node": "Analyze Incident", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Analyze Incident": {
+      "main": [
+        [
+          { "node": "Create Jira Bug",        "type": "main", "index": 0 },
+          { "node": "Create Preventive Story", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "instanceId": "ai-incident-commander-demo"
+  },
+  "pinData": {},
+  "versionId": "1.0.0",
+  "triggerCount": 0
+}
