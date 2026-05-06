@@ -23,6 +23,17 @@ services:
     networks:
       - incident-net
 
+  ai-incident-analyzer:
+    build: ./ai-incident-analyzer
+    container_name: ai-incident-analyzer
+    ports:
+      - "8080:8080"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+    networks:
+      - incident-net
+
   grafana:
     image: grafana/grafana-oss:10.4.2
     container_name: grafana
