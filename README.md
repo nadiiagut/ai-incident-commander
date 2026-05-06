@@ -32,7 +32,29 @@ API docs available at **http://localhost:8000/docs**
 
 ---
 
-## Run with Docker
+## Run with Docker Compose (recommended)
+
+Starts the checkout service **and** Prometheus together on a shared network.
+
+```bash
+docker compose up --build
+```
+
+| Service | URL |
+|---------|-----|
+| Checkout API | http://localhost:8000 |
+| Swagger UI | http://localhost:8000/docs |
+| Prometheus | http://localhost:9090 |
+
+Prometheus scrapes `/metrics` from `demo-edge-service:8000` every **5 seconds**.  
+To query the counter in Prometheus: `http_requests_total{endpoint="/checkout"}`
+
+```bash
+# Stop and remove containers
+docker compose down
+```
+
+## Run with Docker (standalone)
 
 ```bash
 # Build

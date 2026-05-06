@@ -1,0 +1,28 @@
+services:
+  demo-edge-service:
+    build: .
+    container_name: demo-edge-service
+    ports:
+      - "8000:8000"
+    environment:
+      - DEPLOYMENT_VERSION=1.0.0
+    networks:
+      - incident-net
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    depends_on:
+      - demo-edge-service
+    networks:
+      - incident-net
+
+networks:
+  incident-net:
+    driver: bridge
