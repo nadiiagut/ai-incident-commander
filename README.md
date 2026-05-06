@@ -40,14 +40,23 @@ Starts the checkout service **and** Prometheus together on a shared network.
 docker compose up --build
 ```
 
-| Service | URL |
-|---------|-----|
-| Checkout API | http://localhost:8000 |
-| Swagger UI | http://localhost:8000/docs |
-| Prometheus | http://localhost:9090 |
+| Service | URL | Credentials |
+|---------|-----|-------------|
+| Checkout API | http://localhost:8000 | — |
+| Swagger UI | http://localhost:8000/docs | — |
+| Prometheus | http://localhost:9090 | — |
+| Grafana | http://localhost:3000 | admin / admin |
 
 Prometheus scrapes `/metrics` from `demo-edge-service:8000` every **5 seconds**.  
-To query the counter in Prometheus: `http_requests_total{endpoint="/checkout"}`
+Grafana opens at **http://localhost:3000** (admin / admin) with the **Incident Commander — Checkout Service** dashboard pre-loaded.
+
+Dashboard panels:
+
+| Panel | Query |
+|-------|-------|
+| Request Rate | `rate(http_requests_total{endpoint="/checkout"}[1m])` |
+| 500 Error Rate | `rate(http_requests_total{endpoint="/checkout",status_code="500"}[1m])` |
+| p95 Latency | `histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{endpoint="/checkout"}[1m]))` |
 
 ```bash
 # Stop and remove containers
@@ -66,6 +75,26 @@ docker run -p 8000:8000 checkout-service
 # Run with a custom deployment version label (appears in logs)
 docker run -p 8000:8000 -e DEPLOYMENT_VERSION=2.1.0 checkout-service
 ```
+
+---
+
+## Creating an Alert Rule for 500 Errors
+
+From Grafana UI after `docker compose up --build`:
+
+1. Open **http://localhost:3000** → log in as `admin / admin`.
+2. Navigate to **Alerting → Alert rules → New alert rule**.
+3. Set **Rule name**: `checkout-500-error-rate`.
+4. Under **Define query and alert condition**, paste the expression:
+   ```
+   rate(http_requests_total{endpoint="/checkout",status_code="500"}[1m])
+   ```
+5. Set **Threshold** condition: `IS ABOVE 0` (fires on any 500 error).
+6. Under **Set evaluation behaviour**, create or select a folder and evaluation group with **Evaluate every `10s`**, **Pending period `0s`** (fires immediately).
+7. Under **Configure labels and notifications**, add a label such as `severity=critical`.
+8. Click **Save rule and exit**.
+
+To trigger the alert: run `curl -X POST http://localhost:8000/toggle-failure`, then call `/checkout` a few times. The alert will move from `Normal → Firing` within one evaluation cycle.
 
 ---
 
