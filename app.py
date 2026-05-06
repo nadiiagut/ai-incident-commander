@@ -1,10 +1,12 @@
 import json
+import logging
 import os
 import time
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request, Response
+from fastapi import BackgroundTasks, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -16,6 +18,11 @@ from prometheus_client import (
 # ── Configuration ──────────────────────────────────────────────────────────────
 DEPLOYMENT_VERSION = os.getenv("DEPLOYMENT_VERSION", "1.0.0")
 SERVICE_NAME = "checkout-service"
+HYDROLIX_INGEST_URL: str = os.getenv("HYDROLIX_INGEST_URL", "")
+HYDROLIX_TOKEN: str = os.getenv("HYDROLIX_TOKEN", "")
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+_log = logging.getLogger(SERVICE_NAME)
 
 # ── Prometheus metrics ─────────────────────────────────────────────────────────
 REQUEST_COUNT = Counter(
@@ -52,22 +59,50 @@ async def metrics_middleware(request: Request, call_next):
     return response
 
 
+# ── Hydrolix log shipper ───────────────────────────────────────────────────────
+def _ship_to_hydrolix(record: dict) -> None:
+    """POST a single log record to Hydrolix HTTP ingest. Never raises."""
+    if not HYDROLIX_INGEST_URL or not HYDROLIX_TOKEN:
+        return
+    try:
+        body = json.dumps(record).encode()
+        req = urllib.request.Request(
+            HYDROLIX_INGEST_URL,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {HYDROLIX_TOKEN}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status >= 400:
+                _log.error(
+                    "Hydrolix ingest returned HTTP %s for request_id=%s",
+                    resp.status,
+                    record.get("request_id"),
+                )
+    except Exception as exc:
+        _log.error(
+            "Hydrolix ingest failed: %s (request_id=%s)",
+            exc,
+            record.get("request_id"),
+        )
+
+
 # ── Structured logger ──────────────────────────────────────────────────────────
-def _log_checkout(*, status: int, error: str | None, request_id: str) -> None:
-    print(
-        json.dumps(
-            {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "service": SERVICE_NAME,
-                "endpoint": "/checkout",
-                "status": status,
-                "error": error,
-                "deployment_version": DEPLOYMENT_VERSION,
-                "request_id": request_id,
-            }
-        ),
-        flush=True,
-    )
+def _log_checkout(*, status: int, error: str | None, request_id: str) -> dict:
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "service": SERVICE_NAME,
+        "endpoint": "/checkout",
+        "status": status,
+        "error": error,
+        "deployment_version": DEPLOYMENT_VERSION,
+        "request_id": request_id,
+    }
+    print(json.dumps(record), flush=True)
+    return record
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -77,15 +112,17 @@ def health():
 
 
 @app.get("/checkout", summary="Process a checkout")
-def checkout():
+def checkout(background_tasks: BackgroundTasks):
     global _healthy
     request_id = str(uuid.uuid4())
 
     if _healthy:
-        _log_checkout(status=200, error=None, request_id=request_id)
+        record = _log_checkout(status=200, error=None, request_id=request_id)
+        background_tasks.add_task(_ship_to_hydrolix, record)
         return JSONResponse(status_code=200, content={"checkout": "ok"})
 
-    _log_checkout(status=500, error="payment_gateway_timeout", request_id=request_id)
+    record = _log_checkout(status=500, error="payment_gateway_timeout", request_id=request_id)
+    background_tasks.add_task(_ship_to_hydrolix, record)
     return JSONResponse(
         status_code=500,
         content={"error": "payment_gateway_timeout"},
