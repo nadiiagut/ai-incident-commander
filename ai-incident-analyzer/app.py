@@ -2,6 +2,7 @@ import json
 import logging
 import os
 
+import hydrolix_client
 from fastapi import FastAPI
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -9,6 +10,9 @@ from pydantic import BaseModel, Field
 # ── Configuration ──────────────────────────────────────────────────────────────
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+HYDROLIX_QUERY_URL: str = os.getenv("HYDROLIX_QUERY_URL", "")
+HYDROLIX_TOKEN: str = os.getenv("HYDROLIX_TOKEN", "")
+HYDROLIX_TABLE: str = os.getenv("HYDROLIX_TABLE", "logs")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ai-incident-analyzer")
@@ -41,14 +45,34 @@ class IncidentAnalysis(BaseModel):
     acceptance_criteria: str = Field(..., description="Bullet-point AC for the preventive Story")
 
 
-# ── Mocked log evidence ────────────────────────────────────────────────────────
+# ── Log evidence ────────────────────────────────────────────────────────────────
 
 def _fetch_log_evidence(service: str) -> dict:
     """
-    Return mocked recent error log evidence for the service.
+    Return recent error log evidence for *service*.
 
-    Replace with a real log aggregation query (Loki, CloudWatch, Datadog, …)
-    once available.
+    Tries Hydrolix first (last 10 min, status>=500 or error not null).
+    Falls back to _mock_evidence when:
+    - HYDROLIX_QUERY_URL / HYDROLIX_TOKEN are not set
+    - The live query fails or returns 0 rows
+    """
+    live = hydrolix_client.fetch_evidence(
+        service,
+        query_url=HYDROLIX_QUERY_URL,
+        token=HYDROLIX_TOKEN,
+        table=HYDROLIX_TABLE,
+    )
+    if live is not None:
+        log.info("Using live Hydrolix evidence for service=%s (%d errors)", service, live.get("total_errors", 0))
+        return live
+    log.info("Using mocked evidence for service=%s", service)
+    return _mock_evidence(service)
+
+
+def _mock_evidence(service: str) -> dict:
+    """
+    Return static mocked error log evidence.
+    Used when Hydrolix is not configured or the live query fails.
     """
     return {
         "service": service,
