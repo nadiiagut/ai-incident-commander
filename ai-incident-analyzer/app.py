@@ -42,7 +42,7 @@ class IncidentAnalysis(BaseModel):
     jira_incident_description: str = Field(..., description="Detailed Jira Bug description (Jira wiki markup)")
     preventive_story_title: str = Field(..., description="Jira Story title for preventive engineering work")
     preventive_story_description: str = Field(..., description="Story description covering root-cause fix scope")
-    acceptance_criteria: str = Field(..., description="Bullet-point AC for the preventive Story")
+    acceptance_criteria: list[str] = Field(..., description="Acceptance criteria items for the preventive Story")
 
 
 # ── Log evidence ────────────────────────────────────────────────────────────────
@@ -144,7 +144,7 @@ def _build_user_message(alert: AlertPayload, evidence: dict) -> str:
         '  "jira_incident_description": "Detailed Jira Bug description in Jira wiki markup",\n'
         '  "preventive_story_title": "Jira Story title for preventing recurrence",\n'
         '  "preventive_story_description": "Story description — scope of the fix",\n'
-        '  "acceptance_criteria": "- criterion 1\\n- criterion 2"\n'
+        '  "acceptance_criteria": ["criterion 1", "criterion 2", "criterion 3"]\n'
         "}\n\n"
         "Return ONLY the JSON object. No markdown, no explanation."
     )
@@ -218,15 +218,15 @@ def _fallback(alert: AlertPayload) -> IncidentAnalysis:
             "* Create a runbook for this alert and link it from the Grafana alert rule\n"
             "* Review and tighten the payment-gateway timeout configuration"
         ),
-        acceptance_criteria=(
-            "- A circuit breaker trips after 5 consecutive payment gateway failures "
-            "and returns a graceful error to the customer within 500 ms\n"
-            "- The deployment pipeline runs /checkout smoke test and blocks if error "
-            "rate > 1% after 60 s\n"
-            "- A runbook is created, reviewed, and linked from the Grafana alert rule\n"
-            "- The incident does not recur within 30 days of the fix being deployed\n"
-            "- Payment gateway timeout value is documented and under version control"
-        ),
+        acceptance_criteria=[
+            "A circuit breaker trips after 5 consecutive payment gateway failures "
+            "and returns a graceful error to the customer within 500 ms",
+            "The deployment pipeline runs /checkout smoke test and blocks if error "
+            "rate > 1% after 60 s",
+            "A runbook is created, reviewed, and linked from the Grafana alert rule",
+            "The incident does not recur within 30 days of the fix being deployed",
+            "Payment gateway timeout value is documented and under version control",
+        ],
     )
 
 
