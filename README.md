@@ -159,6 +159,52 @@ curl -X POST http://localhost:8000/toggle-failure
 
 ---
 
+## AI Incident Analyzer
+
+The analyzer receives a normalized alert from n8n, queries ClickHouse for recent `/checkout` failures, enriches client IPs via IPinfo, and returns a structured Jira Bug report.
+
+### Trigger an analysis manually
+
+```bash
+curl -s -X POST http://localhost:8080/analyze-incident \
+  -H "Content-Type: application/json" \
+  -d '{
+    "alert_name": "checkout-500-error-rate",
+    "service": "checkout-api",
+    "severity": "critical",
+    "status": "firing",
+    "starts_at": "2026-05-10T09:30:00Z",
+    "dashboard_url": "http://localhost:3000/d/incident-commander",
+    "demo_mode": false
+  }' | jq .
+```
+
+Use `"demo_mode": true` to get the hardcoded fallback response without calling OpenAI or ClickHouse.
+
+### Response fields
+
+| Field | Description |
+|-------|-------------|
+| `incident_started_at` | Timestamp from first ClickHouse error row, or alert `starts_at` |
+| `incident_summary` | 2–3 sentence summary |
+| `probable_root_cause` | Root cause from log evidence |
+| `customer_impact` | Customer-facing impact description |
+| `immediate_actions` | Ordered remediation steps |
+| `jira_incident_title` | Ready-to-use Jira Bug title |
+| `jira_incident_description` | Full Jira wiki markup including log evidence and geographic impact |
+
+### Evidence pipeline
+
+```
+ClickHouse (last 10 min, /checkout, status>=500)
+  └─ 0 rows     → "no evidence found" note injected into prompt
+  └─ rows found → enrich unique client_ips via IPinfo Lite
+                    → failures_by_country, failures_by_asn, impact_scope
+  └─ unavailable → static mock evidence (demo still works)
+```
+
+---
+
 ## ClickHouse — Log Analytics Backend
 
 ClickHouse stores structured log events from `demo-edge-service` for evidence-backed incident analysis.  

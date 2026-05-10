@@ -31,6 +31,12 @@ services:
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_DATABASE=incident_demo
+      - CLICKHOUSE_TABLE=checkout_logs
+      - IPINFO_TOKEN=${IPINFO_TOKEN:-}
+    depends_on:
+      - clickhouse
     networks:
       - incident-net
 

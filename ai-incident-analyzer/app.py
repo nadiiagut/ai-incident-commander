@@ -2,6 +2,8 @@ import json
 import logging
 import os
 
+import clickhouse_client
+import ipinfo_client
 from fastapi import FastAPI
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -9,6 +11,10 @@ from pydantic import BaseModel, Field
 # ── Configuration ──────────────────────────────────────────────────────────────
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+CLICKHOUSE_URL: str = os.getenv("CLICKHOUSE_URL", "")
+CLICKHOUSE_DATABASE: str = os.getenv("CLICKHOUSE_DATABASE", "incident_demo")
+CLICKHOUSE_TABLE: str = os.getenv("CLICKHOUSE_TABLE", "checkout_logs")
+IPINFO_TOKEN: str = os.getenv("IPINFO_TOKEN", "")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ai-incident-analyzer")
@@ -28,58 +34,73 @@ class AlertPayload(BaseModel):
 
 
 class IncidentAnalysis(BaseModel):
-    """Structured analysis returned to n8n for Jira ticket creation."""
+    """Structured analysis returned to n8n for Jira Bug creation."""
 
+    incident_started_at: str = Field(..., description="When the incident started (ISO timestamp or 'unknown')")
     incident_summary: str = Field(..., description="2–3 sentence incident summary")
     probable_root_cause: str = Field(..., description="Most likely root cause from log evidence")
     customer_impact: str = Field(..., description="How end-customers are affected right now")
     immediate_actions: list[str] = Field(..., description="Ordered list of immediate remediation steps")
     jira_incident_title: str = Field(..., description="Concise Jira Bug title (≤80 chars)")
-    jira_incident_description: str = Field(..., description="Detailed Jira Bug description (Jira wiki markup)")
-    preventive_story_title: str = Field(..., description="Jira Story title for preventive engineering work")
-    preventive_story_description: str = Field(..., description="Story description covering root-cause fix scope")
-    acceptance_criteria: list[str] = Field(..., description="Acceptance criteria items for the preventive Story")
+    jira_incident_description: str = Field(..., description="Detailed Jira Bug description in Jira wiki markup")
 
 
-# ── Log evidence ────────────────────────────────────────────────────────────────
+# ── Log evidence (ClickHouse + IPinfo) ─────────────────────────────────────────────
 
 def _fetch_log_evidence(service: str) -> dict:
     """
-    Return recent error log evidence for *service*.
-
-    Currently returns static mocked data.
-    Will be replaced by a live ClickHouse query against incident_demo.checkout_logs.
+    Try ClickHouse first; fall back to static mock when unavailable.
+    Adds IPinfo enrichment for unique client IPs when ClickHouse returns rows.
     """
+    evidence = clickhouse_client.fetch_evidence(
+        query_url=CLICKHOUSE_URL,
+        database=CLICKHOUSE_DATABASE,
+        table=CLICKHOUSE_TABLE,
+    )
+
+    if evidence is None:
+        log.info("ClickHouse unavailable — using mocked evidence")
+        return _mock_evidence(service)
+
+    if evidence.get("no_data"):
+        log.info("No matching logs in ClickHouse (last 10 min, /checkout, status>=500)")
+        evidence["enrichment"] = {"available": False, "reason": "No matching log evidence found in ClickHouse"}
+        return evidence
+
+    unique_ips: list[str] = evidence.get("unique_ips", [])[:20]
+    if unique_ips:
+        raw = ipinfo_client.enrich_ips(unique_ips, IPINFO_TOKEN)
+        if raw:
+            evidence["enrichment"] = ipinfo_client.summarize_enrichment(evidence["ip_counts"], raw)
+            log.info("IPinfo enrichment: %d IPs, scope=%s",
+                     len(raw), evidence["enrichment"].get("impact_scope"))
+        else:
+            log.info("IPinfo enrichment returned no results")
+            evidence["enrichment"] = {"available": False, "reason": "IPinfo enrichment returned no results"}
+    else:
+        evidence["enrichment"] = {"available": False, "reason": "No client IPs in log data"}
+
+    return evidence
+
+
+def _mock_evidence(service: str) -> dict:
+    """Static mocked evidence used when ClickHouse is unavailable."""
     return {
+        "source": "mock",
         "service": service,
-        "deployment_version": "v1.2.8",
-        "last_healthy_version": "v1.2.7",
-        "error_rate_1m": "100%",
-        "recent_errors": [
-            {
-                "timestamp": "2026-05-06T14:00:12Z",
-                "level": "ERROR",
-                "message": "payment_gateway_timeout",
-                "http_status": 500,
-                "deployment_version": "v1.2.8",
-                "trace_id": "abc123def456",
-            },
-            {
-                "timestamp": "2026-05-06T14:00:18Z",
-                "level": "ERROR",
-                "message": "payment_gateway_timeout",
-                "http_status": 500,
-                "deployment_version": "v1.2.8",
-                "trace_id": "abc123def457",
-            },
-            {
-                "timestamp": "2026-05-06T14:00:24Z",
-                "level": "ERROR",
-                "message": "payment_gateway_timeout",
-                "http_status": 500,
-                "deployment_version": "v1.2.8",
-                "trace_id": "abc123def458",
-            },
+        "failed_request_count": 3,
+        "first_seen": "",
+        "latest_seen": "",
+        "dominant_error": "payment_gateway_timeout",
+        "deployment_versions": ["v1.2.8"],
+        "enrichment": {"available": False, "reason": "ClickHouse unavailable"},
+        "recent_sample": [
+            {"timestamp": "2026-05-06 14:00:12.000", "status_code": 500,
+             "error": "payment_gateway_timeout", "deployment_version": "v1.2.8"},
+            {"timestamp": "2026-05-06 14:00:18.000", "status_code": 500,
+             "error": "payment_gateway_timeout", "deployment_version": "v1.2.8"},
+            {"timestamp": "2026-05-06 14:00:24.000", "status_code": 500,
+             "error": "payment_gateway_timeout", "deployment_version": "v1.2.8"},
         ],
     }
 
@@ -106,103 +127,84 @@ def _build_user_message(alert: AlertPayload, evidence: dict) -> str:
         indent=2,
     )
     evidence_block = json.dumps(evidence, indent=2)
+
+    no_data_note = ""
+    if evidence.get("no_data"):
+        no_data_note = (
+            "\nIMPORTANT: No matching log evidence was found in ClickHouse for the last 10 minutes. "
+            "Do NOT fabricate log evidence. Clearly state in your analysis that no log evidence is available "
+            "and base your assessment on the alert metadata only.\n"
+        )
+
     return (
-        "Production alert received. Analyse the following and respond with the JSON object below.\n\n"
+        "Production alert received. Analyse the following and return ONLY a JSON object.\n\n"
         f"## Alert\n{alert_block}\n\n"
+        f"{no_data_note}"
         f"## Log Evidence\n{evidence_block}\n\n"
         "## Required JSON Response Shape\n"
         "{\n"
-        '  "incident_summary": "2-3 sentence summary of the incident and its current state",\n'
-        '  "probable_root_cause": "Most likely root cause based on the evidence",\n'
-        '  "customer_impact": "How end-customers are affected right now",\n'
+        '  "incident_started_at": "ISO timestamp from evidence.first_seen, or alert.starts_at, or unknown",\n'
+        '  "incident_summary": "2-3 sentence summary",\n'
+        '  "probable_root_cause": "Root cause from evidence",\n'
+        '  "customer_impact": "How end-customers are affected",\n'
         '  "immediate_actions": ["step 1", "step 2", "step 3"],\n'
         '  "jira_incident_title": "Concise Jira Bug title (max 80 chars)",\n'
-        '  "jira_incident_description": "Detailed Jira Bug description in Jira wiki markup",\n'
-        '  "preventive_story_title": "Jira Story title for preventing recurrence",\n'
-        '  "preventive_story_description": "Story description — scope of the fix",\n'
-        '  "acceptance_criteria": ["criterion 1", "criterion 2", "criterion 3"]\n'
+        '  "jira_incident_description": "Jira wiki markup. Must include sections: Incident Summary '
+        '(alert metadata), Log Evidence (failed_request_count, first_seen, latest_seen, dominant_error, '
+        'deployment_version), Geographic Impact (top countries and ASNs from enrichment, or N/A), '
+        'Recent Log Sample (table of last 5 rows), Actions Taken (placeholder)"\n'
         "}\n\n"
-        "Return ONLY the JSON object. No markdown, no explanation."
+        "Return ONLY the JSON object. No markdown fences, no extra text."
     )
 
 
-# ── Safe fallback ──────────────────────────────────────────────────────────────
+# ── Safe fallback ────────────────────────────────────────────────────────────────
 
-def _fallback(alert: AlertPayload) -> IncidentAnalysis:
+def _fallback(alert: AlertPayload, incident_started_at: str = "") -> IncidentAnalysis:
     """
     Deterministic response used when:
+    - demo_mode is True
     - OPENAI_API_KEY is absent
     - The LLM call fails for any reason
-    - demo_mode is True
     """
+    started = incident_started_at or alert.starts_at or "unknown"
     return IncidentAnalysis(
+        incident_started_at=started,
         incident_summary=(
             f"Alert '{alert.alert_name}' is firing for service '{alert.service}' "
             f"with severity {alert.severity}. "
-            "Log evidence shows repeated HTTP 500 payment_gateway_timeout errors "
-            "starting after deployment v1.2.8."
+            "HTTP 500 errors detected on the /checkout endpoint."
         ),
         probable_root_cause=(
-            "Deployment v1.2.8 introduced a regression in the payment gateway client. "
-            "All checkout requests are failing with payment_gateway_timeout since the "
-            "deployment at 14:00 UTC. v1.2.7 was the last healthy version."
+            "A recent deployment introduced a regression in the payment gateway client. "
+            "All checkout requests are failing with payment_gateway_timeout."
         ),
         customer_impact=(
-            "100% of checkout attempts are failing. Customers cannot complete purchases. "
-            "Revenue impact grows linearly with time until the incident is resolved."
+            "Checkout attempts are failing. Customers cannot complete purchases. "
+            "Revenue impact grows linearly until the incident is resolved."
         ),
         immediate_actions=[
-            "Rollback checkout-api to v1.2.7 immediately",
+            f"Rollback {alert.service} to the last known-good version immediately",
             "Verify payment gateway connectivity independently",
-            "Page the on-call engineer and the release owner of v1.2.8",
+            "Page the on-call engineer and the release owner",
             "Open a war-room channel and post status to the customer status page",
             "Monitor error rate after rollback to confirm resolution",
         ],
-        jira_incident_title=f"[INCIDENT] {alert.alert_name} — {alert.service} 100% 500s",
+        jira_incident_title=f"[INCIDENT] {alert.alert_name} — {alert.service} checkout failures",
         jira_incident_description=(
             "h2. Incident Summary\n\n"
             f"*Alert:* {alert.alert_name}\n"
             f"*Service:* {alert.service}\n"
             f"*Severity:* {alert.severity}\n"
-            f"*Started:* {alert.starts_at or 'unknown'}\n"
+            f"*Started:* {started}\n"
             f"*Dashboard:* {alert.dashboard_url or 'N/A'}\n\n"
-            "h2. Symptoms\n\n"
-            "* 100% HTTP 500 error rate on /checkout\n"
-            "* Error message: {{payment_gateway_timeout}}\n"
-            "* First observed after deployment v1.2.8\n\n"
             "h2. Log Evidence\n\n"
-            "||Timestamp||Message||HTTP Status||Version||\n"
-            "|2026-05-06T14:00:12Z|payment_gateway_timeout|500|v1.2.8|\n"
-            "|2026-05-06T14:00:18Z|payment_gateway_timeout|500|v1.2.8|\n"
-            "|2026-05-06T14:00:24Z|payment_gateway_timeout|500|v1.2.8|\n\n"
+            "_Live ClickHouse evidence not available — see Grafana dashboard for current metrics._\n\n"
+            "h2. Geographic Impact\n\n"
+            "_IPinfo enrichment not available._\n\n"
             "h2. Actions Taken\n\n"
             "* _To be filled by on-call engineer_"
         ),
-        preventive_story_title=(
-            "Add payment-gateway circuit breaker and pre-deploy smoke test to checkout-api"
-        ),
-        preventive_story_description=(
-            "h2. Context\n\n"
-            "The v1.2.8 deployment caused a complete checkout outage due to a "
-            "payment_gateway_timeout regression with no automatic circuit breaker or "
-            "canary gate to catch it.\n\n"
-            "h2. Scope\n\n"
-            "* Implement a circuit-breaker (e.g. resilience4j / tenacity) around the "
-            "payment gateway client so partial failures do not cascade to 100% error rate\n"
-            "* Add a /checkout smoke test to the deployment pipeline that blocks promotion "
-            "if error rate exceeds 1% after 60 s\n"
-            "* Create a runbook for this alert and link it from the Grafana alert rule\n"
-            "* Review and tighten the payment-gateway timeout configuration"
-        ),
-        acceptance_criteria=[
-            "A circuit breaker trips after 5 consecutive payment gateway failures "
-            "and returns a graceful error to the customer within 500 ms",
-            "The deployment pipeline runs /checkout smoke test and blocks if error "
-            "rate > 1% after 60 s",
-            "A runbook is created, reviewed, and linked from the Grafana alert rule",
-            "The incident does not recur within 30 days of the fix being deployed",
-            "Payment gateway timeout value is documented and under version control",
-        ],
     )
 
 
@@ -228,8 +230,8 @@ def _call_openai(alert: AlertPayload, evidence: dict) -> IncidentAnalysis:
 
 app = FastAPI(
     title="AI Incident Analyzer",
-    description="Analyses Grafana alerts and mocked log evidence to produce structured Jira-ready incident reports.",
-    version="1.0.0",
+    description="Analyses Grafana alerts with live ClickHouse evidence and IPinfo enrichment to produce Jira Bug reports.",
+    version="2.0.0",
 )
 
 
@@ -241,21 +243,22 @@ def health() -> dict:
 @app.post(
     "/analyze-incident",
     response_model=IncidentAnalysis,
-    summary="Analyse a firing alert and return a structured incident report",
+    summary="Analyse a firing alert and return a structured Jira Bug report",
 )
 def analyze_incident(alert: AlertPayload) -> IncidentAnalysis:
     log.info("Received alert: %s | service=%s severity=%s demo_mode=%s",
              alert.alert_name, alert.service, alert.severity, alert.demo_mode)
 
     evidence = _fetch_log_evidence(alert.service)
+    incident_started_at = evidence.get("first_seen") or alert.starts_at or "unknown"
 
     if alert.demo_mode:
         log.info("demo_mode=True — returning fallback analysis")
-        return _fallback(alert)
+        return _fallback(alert, incident_started_at)
 
     if not OPENAI_API_KEY:
         log.warning("OPENAI_API_KEY not set — returning fallback analysis")
-        return _fallback(alert)
+        return _fallback(alert, incident_started_at)
 
     try:
         result = _call_openai(alert, evidence)
@@ -263,4 +266,4 @@ def analyze_incident(alert: AlertPayload) -> IncidentAnalysis:
         return result
     except Exception as exc:
         log.error("OpenAI call failed (%s) — returning fallback analysis", exc)
-        return _fallback(alert)
+        return _fallback(alert, incident_started_at)
