@@ -15,6 +15,8 @@ OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 CLICKHOUSE_URL: str = os.getenv("CLICKHOUSE_URL", "")
 CLICKHOUSE_DATABASE: str = os.getenv("CLICKHOUSE_DATABASE", "incident_demo")
 CLICKHOUSE_TABLE: str = os.getenv("CLICKHOUSE_TABLE", "checkout_logs")
+CLICKHOUSE_USERNAME: str = os.getenv("CLICKHOUSE_USERNAME", "")
+CLICKHOUSE_PASSWORD: str = os.getenv("CLICKHOUSE_PASSWORD", "")
 IPINFO_TOKEN: str = os.getenv("IPINFO_TOKEN", "")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -90,6 +92,8 @@ def _fetch_log_evidence(service: str) -> dict:
         query_url=CLICKHOUSE_URL,
         database=CLICKHOUSE_DATABASE,
         table=CLICKHOUSE_TABLE,
+        username=CLICKHOUSE_USERNAME,
+        password=CLICKHOUSE_PASSWORD,
     )
 
     if evidence is None:
@@ -414,7 +418,8 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
     since_expr = f"toDateTime64('{since_ts}', 3, 'UTC')"
 
     full_ev = clickhouse_client.fetch_since(
-        CLICKHOUSE_URL, CLICKHOUSE_DATABASE, CLICKHOUSE_TABLE, req.endpoint, since_expr
+        CLICKHOUSE_URL, CLICKHOUSE_DATABASE, CLICKHOUSE_TABLE, req.endpoint, since_expr,
+        CLICKHOUSE_USERNAME, CLICKHOUSE_PASSWORD,
     )
     if full_ev is None:
         return _monitor_failed(req, "ClickHouse query failed (full window)")
@@ -422,6 +427,7 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
     recent_ev = clickhouse_client.fetch_since(
         CLICKHOUSE_URL, CLICKHOUSE_DATABASE, CLICKHOUSE_TABLE,
         req.endpoint, "now() - INTERVAL 5 MINUTE",
+        CLICKHOUSE_USERNAME, CLICKHOUSE_PASSWORD,
     )
     if recent_ev is None:
         return _monitor_failed(req, "ClickHouse query failed (5-minute window)")

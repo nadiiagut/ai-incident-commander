@@ -5,6 +5,7 @@ Queries the checkout_logs table for recent /checkout failures and returns
 structured evidence.  Returns None on any failure so the caller can fall
 back to mock evidence transparently.
 """
+import base64
 import json
 import logging
 import urllib.request
@@ -13,7 +14,21 @@ _log = logging.getLogger("clickhouse-client")
 _TIMEOUT_S = 10
 
 
-def fetch_evidence(query_url: str, database: str, table: str) -> dict | None:
+def _auth_header(username: str, password: str) -> dict:
+    """Return Basic Auth header dict when credentials are provided."""
+    if username and password:
+        token = base64.b64encode(f"{username}:{password}".encode()).decode()
+        return {"Authorization": f"Basic {token}"}
+    return {}
+
+
+def fetch_evidence(
+    query_url: str,
+    database: str,
+    table: str,
+    username: str = "",
+    password: str = "",
+) -> dict | None:
     """
     Query ClickHouse for /checkout errors in the last 10 minutes.
 
@@ -52,7 +67,7 @@ def fetch_evidence(query_url: str, database: str, table: str) -> dict | None:
         req = urllib.request.Request(
             url,
             data=sql.encode(),
-            headers={"Content-Type": "text/plain"},
+            headers={"Content-Type": "text/plain", **_auth_header(username, password)},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
@@ -78,6 +93,8 @@ def fetch_since(
     table: str,
     endpoint: str,
     since_expr: str,
+    username: str = "",
+    password: str = "",
 ) -> dict | None:
     """
     Query for status>=500 errors on `endpoint` from `since_expr` until now.
@@ -119,7 +136,7 @@ def fetch_since(
         req = urllib.request.Request(
             url,
             data=sql.encode(),
-            headers={"Content-Type": "text/plain"},
+            headers={"Content-Type": "text/plain", **_auth_header(username, password)},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:

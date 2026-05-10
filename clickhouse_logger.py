@@ -5,6 +5,7 @@ Reads endpoint config from environment at import time.
 All errors are logged locally and swallowed — ClickHouse unavailability
 must never affect the user-facing request.
 """
+import base64
 import json
 import logging
 import os
@@ -16,8 +17,20 @@ _log = logging.getLogger("clickhouse-logger")
 CLICKHOUSE_URL: str = os.getenv("CLICKHOUSE_URL", "")
 CLICKHOUSE_DATABASE: str = os.getenv("CLICKHOUSE_DATABASE", "incident_demo")
 CLICKHOUSE_TABLE: str = os.getenv("CLICKHOUSE_TABLE", "checkout_logs")
+CLICKHOUSE_USERNAME: str = os.getenv("CLICKHOUSE_USERNAME", "")
+CLICKHOUSE_PASSWORD: str = os.getenv("CLICKHOUSE_PASSWORD", "")
 
 _TIMEOUT_S = 3
+
+
+def _auth_headers() -> dict:
+    """Return Basic Auth header dict when credentials are configured."""
+    if CLICKHOUSE_USERNAME and CLICKHOUSE_PASSWORD:
+        token = base64.b64encode(
+            f"{CLICKHOUSE_USERNAME}:{CLICKHOUSE_PASSWORD}".encode()
+        ).decode()
+        return {"Authorization": f"Basic {token}"}
+    return {}
 
 
 def insert(event: dict) -> None:
@@ -39,7 +52,7 @@ def insert(event: dict) -> None:
         req = urllib.request.Request(
             url,
             data=body,
-            headers={"Content-Type": "application/x-ndjson"},
+            headers={"Content-Type": "application/x-ndjson", **_auth_headers()},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:

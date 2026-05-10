@@ -39,7 +39,7 @@ Starts the checkout service **and** Prometheus together on a shared network.
 > **Before first run** — create your `.env` from the example and fill in your keys:
 > ```bash
 > cp .env.example .env
-> # Set OPENAI_API_KEY and IPINFO_TOKEN in .env
+> # Set OPENAI_API_KEY, IPINFO_TOKEN, CLICKHOUSE_USERNAME, and CLICKHOUSE_PASSWORD in .env
 > ```
 
 ```bash
@@ -409,3 +409,6 @@ cp .env.example .env
 | `CLICKHOUSE_URL` | `http://clickhouse:8123` | ClickHouse HTTP endpoint |
 | `CLICKHOUSE_DATABASE` | `incident_demo` | Target database |
 | `CLICKHOUSE_TABLE` | `checkout_logs` | Target table |
+| `CLICKHOUSE_USERNAME` | _(required)_ | ClickHouse user — must match `CLICKHOUSE_USER` set on the server |
+| `CLICKHOUSE_PASSWORD` | _(required)_ | ClickHouse password for the above user |
+| `IPINFO_TOKEN` | _(empty)_ | IPinfo API token — enables geographic IP enrichment |
