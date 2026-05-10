@@ -181,6 +181,54 @@ curl -s -X POST http://localhost:8080/analyze-incident \
 
 Use `"demo_mode": true` to get the hardcoded fallback response without calling OpenAI or ClickHouse.
 
+### Monitor an existing incident (follow-up check)
+
+**Still failing** — run this while the service is broken:
+
+```bash
+curl -s -X POST http://localhost:8080/monitor-incident \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "checkout-api",
+    "endpoint": "/checkout",
+    "incident_started_at": "2026-05-10T09:30:00Z",
+    "jira_issue_key": "INC-42",
+    "alert_name": "checkout-500-error-rate"
+  }' | jq '{incident_status, status_summary, jira_comment}'
+```
+
+Expected when failures are still occurring in the last 5 min:
+```json
+{
+  "incident_status": "still_failing",
+  "status_summary": "Incident INC-42 is still active: N failures in the last 5 minutes ...",
+  "jira_comment": "*[AI Incident Monitor — INC-42]*\n\n*Status:* Incident remains active ..."
+}
+```
+
+**Recovered** — run this after toggling the service back to healthy and waiting 5 minutes:
+
+```bash
+curl -X POST http://localhost:8000/toggle-failure   # restore healthy mode
+# wait 5 minutes, then:
+curl -s -X POST http://localhost:8080/monitor-incident \
+  -H "Content-Type: application/json" \
+  -d '{
+    "service": "checkout-api",
+    "endpoint": "/checkout",
+    "incident_started_at": "2026-05-10T09:30:00Z",
+    "jira_issue_key": "INC-42"
+  }' | jq '{incident_status, status_summary}'
+```
+
+Expected:
+```json
+{
+  "incident_status": "recovered",
+  "status_summary": "Incident INC-42 appears recovered: no /checkout 5xx responses in the last 5 minutes ..."
+}
+```
+
 ### Response fields
 
 | Field | Description |

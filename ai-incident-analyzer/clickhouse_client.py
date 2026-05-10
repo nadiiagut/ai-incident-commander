@@ -72,6 +72,73 @@ def fetch_evidence(query_url: str, database: str, table: str) -> dict | None:
         return None
 
 
+def fetch_since(
+    query_url: str,
+    database: str,
+    table: str,
+    endpoint: str,
+    since_expr: str,
+) -> dict | None:
+    """
+    Query for status>=500 errors on `endpoint` from `since_expr` until now.
+
+    `since_expr` is a ClickHouse SQL expression, e.g.:
+      - "toDateTime64('2026-05-10 09:30:00.000', 3, 'UTC')"
+      - "now() - INTERVAL 5 MINUTE"
+
+    Returns same shape as fetch_evidence, or None on failure.
+    """
+    if not query_url:
+        return None
+
+    safe_endpoint = endpoint.replace("'", "").replace("\\", "")
+
+    sql = (
+        f"SELECT "
+        f"toString(timestamp) AS timestamp, "
+        f"request_id, "
+        f"client_ip, "
+        f"endpoint, "
+        f"status_code, "
+        f"error, "
+        f"deployment_version, "
+        f"response_time_ms "
+        f"FROM {database}.{table} "
+        f"WHERE endpoint = '{safe_endpoint}' "
+        f"AND status_code >= 500 "
+        f"AND timestamp >= {since_expr} "
+        f"ORDER BY timestamp DESC "
+        f"LIMIT 500 "
+        f"FORMAT JSON"
+    )
+
+    url = f"{query_url.rstrip('/')}/"
+    _log.info("Querying ClickHouse since %s for endpoint=%s status>=500", since_expr, safe_endpoint)
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=sql.encode(),
+            headers={"Content-Type": "text/plain"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read())
+
+        rows: list[dict] = payload.get("data", [])
+
+        if not rows:
+            _log.info("ClickHouse returned 0 rows for since=%s", since_expr)
+            return {"source": "clickhouse", "no_data": True}
+
+        _log.info("ClickHouse returned %d rows for since=%s", len(rows), since_expr)
+        return _build_evidence(rows)
+
+    except Exception as exc:
+        _log.warning("ClickHouse query failed: %s", exc)
+        return None
+
+
 def _build_evidence(rows: list[dict]) -> dict:
     timestamps = sorted(r["timestamp"] for r in rows if r.get("timestamp"))
     first_seen = timestamps[0] if timestamps else ""

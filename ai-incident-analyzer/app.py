@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import clickhouse_client
 import ipinfo_client
@@ -43,6 +44,39 @@ class IncidentAnalysis(BaseModel):
     immediate_actions: list[str] = Field(..., description="Ordered list of immediate remediation steps")
     jira_incident_title: str = Field(..., description="Concise Jira Bug title (≤80 chars)")
     jira_incident_description: str = Field(..., description="Detailed Jira Bug description in Jira wiki markup")
+
+
+# ── Monitor models ────────────────────────────────────────────────────────────
+
+class MonitorRequest(BaseModel):
+    """Request body for POST /monitor-incident."""
+
+    service: str = Field(default="checkout-api", description="Service name")
+    endpoint: str = Field(default="/checkout", description="Endpoint to monitor")
+    incident_started_at: str = Field(..., description="ISO 8601 incident start timestamp")
+    jira_issue_key: str = Field(..., description="Jira issue key, e.g. INC-42")
+    alert_name: str = Field(default="", description="Original Grafana alert name")
+
+
+class MonitorEvidence(BaseModel):
+    """Raw metrics collected during the monitoring check."""
+
+    total_failed_requests_since_incident_start: int
+    failed_requests_last_5m: int
+    latest_failed_request: str
+    dominant_error: str
+    top_country: str
+    top_asn: str
+
+
+class MonitorResponse(BaseModel):
+    """Response returned by POST /monitor-incident."""
+
+    jira_issue_key: str
+    incident_status: str = Field(..., description="still_failing | recovered | monitoring_failed")
+    status_summary: str
+    jira_comment: str
+    evidence: MonitorEvidence
 
 
 # ── Log evidence (ClickHouse + IPinfo) ─────────────────────────────────────────────
@@ -226,6 +260,97 @@ def _call_openai(alert: AlertPayload, evidence: dict) -> IncidentAnalysis:
     return IncidentAnalysis(**json.loads(raw))
 
 
+# ── Monitor helpers ────────────────────────────────────────────────────────────
+
+def _parse_ts(ts: str) -> str:
+    """Normalise any ISO 8601-ish timestamp to 'YYYY-MM-DD HH:MM:SS.mmm' UTC."""
+    normalised = ts.strip().replace("T", " ")
+    if normalised.endswith("Z"):
+        normalised = normalised[:-1] + "+00:00"
+    dt = datetime.fromisoformat(normalised)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
+
+
+def _build_status_summary(status: str, ev: MonitorEvidence, req: MonitorRequest) -> str:
+    if status == "still_failing":
+        return (
+            f"Incident {req.jira_issue_key} is still active: "
+            f"{ev.failed_requests_last_5m} failures in the last 5 minutes "
+            f"({ev.total_failed_requests_since_incident_start} total since incident start). "
+            f"Dominant error: {ev.dominant_error or 'N/A'}."
+        )
+    if status == "recovered":
+        return (
+            f"Incident {req.jira_issue_key} appears recovered: "
+            "no /checkout 5xx responses in the last 5 minutes. "
+            f"Total failures since incident start: {ev.total_failed_requests_since_incident_start}. "
+            "Continue monitoring before closing."
+        )
+    return f"Automated monitoring failed for incident {req.jira_issue_key}."
+
+
+def _build_jira_comment(status: str, ev: MonitorEvidence, req: MonitorRequest) -> str:
+    geo = ""
+    if ev.top_country or ev.top_asn:
+        geo = f"\n*Top Affected:* Country: {ev.top_country or 'N/A'}, ASN: {ev.top_asn or 'N/A'}"
+
+    if status == "still_failing":
+        return (
+            f"*[AI Incident Monitor \u2014 {req.jira_issue_key}]*\n\n"
+            "*Status:* Incident remains active\n\n"
+            f"*Failed Requests (last 5 min):* {ev.failed_requests_last_5m}\n"
+            f"*Total Since Incident Start:* {ev.total_failed_requests_since_incident_start}\n"
+            f"*Dominant Error:* {ev.dominant_error or 'N/A'}\n"
+            f"*Latest Failed Request:* {ev.latest_failed_request or 'N/A'}"
+            f"{geo}\n\n"
+            "_No automated Jira transition performed. Review and resolve manually._"
+        )
+    if status == "recovered":
+        return (
+            f"*[AI Incident Monitor \u2014 {req.jira_issue_key}]*\n\n"
+            "*Status:* No new failures observed\n\n"
+            f"No new {req.endpoint} 5xx responses were observed in the last 5 minutes.\n\n"
+            f"*Latest Failed Request:* {ev.latest_failed_request or 'N/A'}\n"
+            f"*Total Since Incident Start:* {ev.total_failed_requests_since_incident_start}\n\n"
+            "The incident appears mitigated but should continue to be monitored before closure.\n\n"
+            "_No automated Jira transition performed. Verify manually before closing._"
+        )
+    return (
+        f"*[AI Incident Monitor \u2014 {req.jira_issue_key}]*\n\n"
+        "The automated follow-up could not retrieve log evidence.\n\n"
+        "_Manual verification of current service health is recommended._"
+    )
+
+
+def _monitor_failed(req: MonitorRequest, reason: str) -> MonitorResponse:
+    log.warning("Monitor failed for %s: %s", req.jira_issue_key, reason)
+    return MonitorResponse(
+        jira_issue_key=req.jira_issue_key,
+        incident_status="monitoring_failed",
+        status_summary=f"Automated monitoring failed: {reason}",
+        jira_comment=_build_jira_comment("monitoring_failed", MonitorEvidence(
+            total_failed_requests_since_incident_start=0,
+            failed_requests_last_5m=0,
+            latest_failed_request="",
+            dominant_error="",
+            top_country="",
+            top_asn="",
+        ), req),
+        evidence=MonitorEvidence(
+            total_failed_requests_since_incident_start=0,
+            failed_requests_last_5m=0,
+            latest_failed_request="",
+            dominant_error="",
+            top_country="",
+            top_asn="",
+        ),
+    )
+
+
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -267,3 +392,69 @@ def analyze_incident(alert: AlertPayload) -> IncidentAnalysis:
     except Exception as exc:
         log.error("OpenAI call failed (%s) — returning fallback analysis", exc)
         return _fallback(alert, incident_started_at)
+
+
+@app.post(
+    "/monitor-incident",
+    response_model=MonitorResponse,
+    summary="Follow-up monitoring check for an existing Jira incident",
+)
+def monitor_incident(req: MonitorRequest) -> MonitorResponse:
+    log.info("Monitor: %s | endpoint=%s since=%s",
+             req.jira_issue_key, req.endpoint, req.incident_started_at)
+
+    if not CLICKHOUSE_URL:
+        return _monitor_failed(req, "CLICKHOUSE_URL not configured")
+
+    try:
+        since_ts = _parse_ts(req.incident_started_at)
+    except Exception as exc:
+        return _monitor_failed(req, f"Invalid incident_started_at: {exc}")
+
+    since_expr = f"toDateTime64('{since_ts}', 3, 'UTC')"
+
+    full_ev = clickhouse_client.fetch_since(
+        CLICKHOUSE_URL, CLICKHOUSE_DATABASE, CLICKHOUSE_TABLE, req.endpoint, since_expr
+    )
+    if full_ev is None:
+        return _monitor_failed(req, "ClickHouse query failed (full window)")
+
+    recent_ev = clickhouse_client.fetch_since(
+        CLICKHOUSE_URL, CLICKHOUSE_DATABASE, CLICKHOUSE_TABLE,
+        req.endpoint, "now() - INTERVAL 5 MINUTE",
+    )
+    if recent_ev is None:
+        return _monitor_failed(req, "ClickHouse query failed (5-minute window)")
+
+    total_failed = 0 if full_ev.get("no_data") else full_ev["failed_request_count"]
+    last_5m = 0 if recent_ev.get("no_data") else recent_ev["failed_request_count"]
+    latest_ts = "" if full_ev.get("no_data") else full_ev.get("latest_seen", "")
+    dominant_error = "" if full_ev.get("no_data") else full_ev.get("dominant_error", "")
+
+    top_country = ""
+    top_asn = ""
+    if not full_ev.get("no_data") and full_ev.get("unique_ips"):
+        raw = ipinfo_client.enrich_ips(full_ev["unique_ips"][:10], IPINFO_TOKEN)
+        if raw:
+            enrich_summary = ipinfo_client.summarize_enrichment(full_ev["ip_counts"], raw)
+            top_country = next(iter(enrich_summary.get("failures_by_country", {})), "")
+            top_asn = enrich_summary.get("top_affected_asn", "")
+
+    status = "still_failing" if last_5m > 0 else "recovered"
+    log.info("Monitor result: %s | last5m=%d total=%d", status, last_5m, total_failed)
+
+    evidence = MonitorEvidence(
+        total_failed_requests_since_incident_start=total_failed,
+        failed_requests_last_5m=last_5m,
+        latest_failed_request=latest_ts,
+        dominant_error=dominant_error,
+        top_country=top_country,
+        top_asn=top_asn,
+    )
+    return MonitorResponse(
+        jira_issue_key=req.jira_issue_key,
+        incident_status=status,
+        status_summary=_build_status_summary(status, evidence, req),
+        jira_comment=_build_jira_comment(status, evidence, req),
+        evidence=evidence,
+    )
