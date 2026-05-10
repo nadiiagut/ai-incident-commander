@@ -68,6 +68,24 @@ services:
     networks:
       - incident-net
 
+  locust:
+    image: locustio/locust:2.29.1
+    container_name: locust
+    ports:
+      - "8089:8089"
+    volumes:
+      - ./locust:/mnt/locust:ro
+    environment:
+      - TRAFFIC_MODE=${TRAFFIC_MODE:-manual}
+      - LOCUST_HOST=http://demo-edge-service:8000
+    command: -f /mnt/locust/locustfile.py
+    depends_on:
+      - demo-edge-service
+    networks:
+      - incident-net
+    profiles:
+      - load-test
+
 networks:
   incident-net:
     driver: bridge

@@ -48,6 +48,7 @@ docker compose up --build
 | Prometheus | http://localhost:9090 | — |
 | Grafana | http://localhost:3000 | admin / admin |
 | ClickHouse HTTP | http://localhost:8123 | — |
+| Locust UI | http://localhost:8089 | — (load-test profile only) |
 
 Prometheus scrapes `/metrics` from `demo-edge-service:8000` every **5 seconds**.  
 Grafana opens at **http://localhost:3000** (admin / admin) with the **Incident Commander — Checkout Service** dashboard pre-loaded.
@@ -155,6 +156,88 @@ Key metrics:
 ```bash
 curl -X POST http://localhost:8000/toggle-failure
 # → {"mode":"healthy","healthy":true}
+```
+
+---
+
+## Synthetic Traffic Generator (Locust)
+
+Locust drives realistic GET `/checkout` traffic with a fixed pool of public demo IPs sent via `X-Forwarded-For`.  
+This ensures ClickHouse logs carry geographic diversity so `/analyze-incident` and `/monitor-incident` produce meaningful IPinfo breakdowns.
+
+### IP pool coverage
+
+| Region | IPs |
+|---|---|
+| North America | Google, Cloudflare, Quad9, OpenDNS |
+| Europe | Yandex (RU), DNS.WATCH (DE), CleanBrowsing (GB), Mullvad (DE) |
+| Asia-Pacific | KT (KR), NordVPN (SG), OVH (AU) |
+| Other | TENET (ZA), Embratel (BR) |
+
+### Traffic modes
+
+| Class | Wait time | Rate | Use case |
+|---|---|---|---|
+| `NormalUser` | 0.8 – 1.5 s | ~1 req/s/user | Background baseline load |
+| `IncidentUser` | 0.05 – 0.15 s | ~10 req/s/user | Fill ClickHouse fast during incident |
+| `DemoShape` | automatic | cycles | Full automated demo progression |
+
+### Run locally
+
+```bash
+pip install locust
+
+# Normal background traffic — web UI at http://localhost:8089
+locust -f locust/locustfile.py NormalUser --host http://localhost:8000
+
+# Incident simulation (run after toggle-failure to generate 500s fast)
+locust -f locust/locustfile.py IncidentUser --host http://localhost:8000
+
+# Headless normal load (5 users, no browser needed)
+locust -f locust/locustfile.py NormalUser \
+  --host http://localhost:8000 \
+  --headless --users 5 --spawn-rate 2
+
+# Headless incident simulation (20 users)
+locust -f locust/locustfile.py IncidentUser \
+  --host http://localhost:8000 \
+  --headless --users 20 --spawn-rate 10
+
+# Automated demo shape: Normal (2 min) → Incident (3 min) → Recovery (2 min)
+TRAFFIC_MODE=demo locust -f locust/locustfile.py \
+  --host http://localhost:8000 \
+  --headless --users 30 --spawn-rate 10
+```
+
+### Run with Docker Compose
+
+The `locust` service uses the `load-test` profile so it never starts with a plain `docker compose up`.
+
+```bash
+# Web UI at http://localhost:8089 — configure users interactively
+docker compose --profile load-test up locust
+
+# Headless normal traffic
+docker compose --profile load-test run --rm \
+  locust locust -f /mnt/locust/locustfile.py NormalUser \
+  --host http://demo-edge-service:8000 \
+  --headless --users 5 --spawn-rate 2
+
+# Automated demo shape (Normal → Incident → Recovery)
+TRAFFIC_MODE=demo docker compose --profile load-test up locust
+```
+
+### Typical demo flow
+
+```
+1. docker compose up --build          # start all services
+2. locust NormalUser (5 users)        # baseline: ClickHouse fills with 200s
+3. curl -X POST localhost:8000/toggle-failure   # break the service
+4. locust IncidentUser (20 users)     # flood ClickHouse with 500s
+5. POST /analyze-incident             # LLM sees real evidence + IPinfo geo
+6. POST /monitor-incident             # incident_status = still_failing
+7. curl -X POST localhost:8000/toggle-failure   # restore healthy mode
+8. wait 5 min, POST /monitor-incident # incident_status = recovered
 ```
 
 ---
