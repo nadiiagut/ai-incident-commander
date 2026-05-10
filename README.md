@@ -36,6 +36,12 @@ API docs available at **http://localhost:8000/docs**
 
 Starts the checkout service **and** Prometheus together on a shared network.
 
+> **Before first run** — create your `.env` from the example and fill in your keys:
+> ```bash
+> cp .env.example .env
+> # Set OPENAI_API_KEY and IPINFO_TOKEN in .env
+> ```
+
 ```bash
 docker compose up --build
 ```
