@@ -177,6 +177,25 @@ curl http://localhost:8123/ping
 curl "http://localhost:8123/?query=DESCRIBE+incident_demo.checkout_logs"
 ```
 
+### Send a checkout request with a custom client IP
+
+```bash
+curl -H "X-Forwarded-For: 1.2.3.4" http://localhost:8000/checkout
+```
+
+The service reads the first IP from `X-Forwarded-For` when present, otherwise uses the raw TCP remote address.
+
+### Confirm the row was written to ClickHouse
+
+```bash
+curl "http://localhost:8123/?query=SELECT+request_id,client_ip,status_code,error,response_time_ms+FROM+incident_demo.checkout_logs+ORDER+BY+timestamp+DESC+LIMIT+1+FORMAT+JSONEachRow"
+```
+
+Expected output:
+```json
+{"request_id":"...","client_ip":"1.2.3.4","status_code":200,"error":null,"response_time_ms":0}
+```
+
 ### Query the latest logs
 
 ```bash
