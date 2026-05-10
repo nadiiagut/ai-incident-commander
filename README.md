@@ -44,8 +44,10 @@ docker compose up --build
 |---------|-----|-------------|
 | Checkout API | http://localhost:8000 | — |
 | Swagger UI | http://localhost:8000/docs | — |
+| AI Analyzer | http://localhost:8080/docs | — |
 | Prometheus | http://localhost:9090 | — |
 | Grafana | http://localhost:3000 | admin / admin |
+| ClickHouse HTTP | http://localhost:8123 | — |
 
 Prometheus scrapes `/metrics` from `demo-edge-service:8000` every **5 seconds**.  
 Grafana opens at **http://localhost:3000** (admin / admin) with the **Incident Commander — Checkout Service** dashboard pre-loaded.
@@ -157,8 +159,51 @@ curl -X POST http://localhost:8000/toggle-failure
 
 ---
 
+## ClickHouse — Log Analytics Backend
+
+ClickHouse stores structured log events from `demo-edge-service` for evidence-backed incident analysis.  
+The `incident_demo` database and `checkout_logs` table are created automatically on first start via `clickhouse/init/01_init.sql`.
+
+### Verify ClickHouse is alive
+
+```bash
+curl http://localhost:8123/ping
+# → Ok.
+```
+
+### Show the checkout_logs table schema
+
+```bash
+curl "http://localhost:8123/?query=DESCRIBE+incident_demo.checkout_logs"
+```
+
+### Query the latest logs
+
+```bash
+curl "http://localhost:8123/?query=SELECT+*+FROM+incident_demo.checkout_logs+ORDER+BY+timestamp+DESC+LIMIT+10+FORMAT+JSONEachRow"
+```
+
+### Query recent errors only
+
+```bash
+curl "http://localhost:8123/?query=SELECT+*+FROM+incident_demo.checkout_logs+WHERE+status_code>=500+ORDER+BY+timestamp+DESC+LIMIT+20+FORMAT+JSONEachRow"
+```
+
+---
+
 ## Environment Variables
+
+Copy `.env.example` to `.env` and fill in your values:
+
+```bash
+cp .env.example .env
+```
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DEPLOYMENT_VERSION` | `1.0.0` | Version string included in every structured log line |
+| `OPENAI_API_KEY` | _(empty)_ | OpenAI key — omit to use hardcoded fallback analysis |
+| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model used by the analyzer |
+| `CLICKHOUSE_URL` | `http://clickhouse:8123` | ClickHouse HTTP endpoint |
+| `CLICKHOUSE_DATABASE` | `incident_demo` | Target database |
+| `CLICKHOUSE_TABLE` | `checkout_logs` | Target table |

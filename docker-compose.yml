@@ -50,6 +50,21 @@ services:
     networks:
       - incident-net
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - incident-net
+
 networks:
   incident-net:
     driver: bridge
+
+volumes:
+  clickhouse-data:
