@@ -457,35 +457,41 @@ def _build_status_summary(status: str, ev: MonitorEvidence, req: MonitorRequest)
 
 
 def _build_jira_comment(status: str, ev: MonitorEvidence, req: MonitorRequest) -> str:
-    geo = ""
-    if ev.top_country or ev.top_asn:
-        geo = f"\n*Top Affected:* Country: {ev.top_country or 'N/A'}, ASN: {ev.top_asn or 'N/A'}"
+    header = f"AI Incident Monitor \u2014 {req.jira_issue_key}\n\n"
 
     if status == "still_failing":
+        geo = ""
+        if ev.top_country or ev.top_asn:
+            geo = (
+                f"Top affected country: {ev.top_country or 'N/A'}\n"
+                f"Top affected ASN: {ev.top_asn or 'N/A'}\n"
+            )
         return (
-            f"*[AI Incident Monitor \u2014 {req.jira_issue_key}]*\n\n"
-            "*Status:* Incident remains active\n\n"
-            f"*Failed Requests (last 5 min):* {ev.failed_requests_last_5m}\n"
-            f"*Total Since Incident Start:* {ev.total_failed_requests_since_incident_start}\n"
-            f"*Dominant Error:* {ev.dominant_error or 'N/A'}\n"
-            f"*Latest Failed Request:* {ev.latest_failed_request or 'N/A'}"
-            f"{geo}\n\n"
-            "_No automated Jira transition performed. Review and resolve manually._"
+            header
+            + "Status: Incident remains active\n\n"
+            + f"Failed requests in the last 5 minutes: {ev.failed_requests_last_5m}\n"
+            + f"Total since incident start: {ev.total_failed_requests_since_incident_start}\n"
+            + f"Dominant error: {ev.dominant_error or 'N/A'}\n"
+            + f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
+            + geo
+            + "\nNo automated Jira transition was performed. Manual mitigation is still required."
         )
+
     if status == "recovered":
         return (
-            f"*[AI Incident Monitor \u2014 {req.jira_issue_key}]*\n\n"
-            "*Status:* No new failures observed\n\n"
-            f"No new {req.endpoint} 5xx responses were observed in the last 5 minutes.\n\n"
-            f"*Latest Failed Request:* {ev.latest_failed_request or 'N/A'}\n"
-            f"*Total Since Incident Start:* {ev.total_failed_requests_since_incident_start}\n\n"
-            "The incident appears mitigated but should continue to be monitored before closure.\n\n"
-            "_No automated Jira transition performed. Verify manually before closing._"
+            header
+            + "Status: No new failures observed\n\n"
+            + f"No new {req.endpoint} 5xx responses were observed in the last 5 minutes.\n\n"
+            + f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
+            + f"Total since incident start: {ev.total_failed_requests_since_incident_start}\n\n"
+            + "The incident appears mitigated but should continue to be monitored before closure.\n\n"
+            + "No automated Jira transition was performed. Verify manually before closing."
         )
+
     return (
-        f"*[AI Incident Monitor \u2014 {req.jira_issue_key}]*\n\n"
-        "The automated follow-up could not retrieve log evidence.\n\n"
-        "_Manual verification of current service health is recommended._"
+        header
+        + "Automated follow-up could not retrieve ClickHouse evidence.\n\n"
+        + "Manual verification of current service health is recommended."
     )
 
 
