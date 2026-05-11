@@ -8,6 +8,7 @@ back to mock evidence transparently.
 import base64
 import json
 import logging
+import urllib.error
 import urllib.request
 
 _log = logging.getLogger("clickhouse-client")
@@ -20,6 +21,46 @@ def _auth_header(username: str, password: str) -> dict:
         token = base64.b64encode(f"{username}:{password}".encode()).decode()
         return {"Authorization": f"Basic {token}"}
     return {}
+
+
+def _run_query(url: str, sql: str, username: str, password: str) -> list[dict] | None:
+    """
+    Send `sql` to ClickHouse via HTTP POST and return the `data` list.
+
+    Returns:
+      list[dict]  — rows (may be empty)
+      None        — any failure (error already logged at WARNING level)
+    """
+    _log.info("ClickHouse query | url=%s auth=%s | sql=%s",
+              url, bool(username and password), sql.replace("\n", " "))
+    try:
+        req = urllib.request.Request(
+            url,
+            data=sql.encode(),
+            headers={"Content-Type": "text/plain", **_auth_header(username, password)},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read())
+        rows: list[dict] = payload.get("data", [])
+        _log.info("ClickHouse returned %d row(s)", len(rows))
+        return rows
+
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        _log.warning(
+            "ClickHouse HTTP %s %s | url=%s | body=%s",
+            exc.code, exc.reason, url, body[:1000],
+        )
+        return None
+
+    except Exception as exc:
+        _log.warning("ClickHouse request failed: %s | url=%s", exc, url)
+        return None
 
 
 def fetch_evidence(
@@ -61,30 +102,12 @@ def fetch_evidence(
     )
 
     url = f"{query_url.rstrip('/')}/"
-    _log.info("Querying ClickHouse: %s.%s last 10 min /checkout status>=500", database, table)
-
-    try:
-        req = urllib.request.Request(
-            url,
-            data=sql.encode(),
-            headers={"Content-Type": "text/plain", **_auth_header(username, password)},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
-            payload = json.loads(resp.read())
-
-        rows: list[dict] = payload.get("data", [])
-
-        if not rows:
-            _log.info("ClickHouse returned 0 error rows")
-            return {"source": "clickhouse", "no_data": True}
-
-        _log.info("ClickHouse returned %d error rows", len(rows))
-        return _build_evidence(rows)
-
-    except Exception as exc:
-        _log.warning("ClickHouse query failed: %s", exc)
+    rows = _run_query(url, sql, username, password)
+    if rows is None:
         return None
+    if not rows:
+        return {"source": "clickhouse", "no_data": True}
+    return _build_evidence(rows)
 
 
 def fetch_since(
@@ -130,30 +153,12 @@ def fetch_since(
     )
 
     url = f"{query_url.rstrip('/')}/"
-    _log.info("Querying ClickHouse since %s for endpoint=%s status>=500", since_expr, safe_endpoint)
-
-    try:
-        req = urllib.request.Request(
-            url,
-            data=sql.encode(),
-            headers={"Content-Type": "text/plain", **_auth_header(username, password)},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
-            payload = json.loads(resp.read())
-
-        rows: list[dict] = payload.get("data", [])
-
-        if not rows:
-            _log.info("ClickHouse returned 0 rows for since=%s", since_expr)
-            return {"source": "clickhouse", "no_data": True}
-
-        _log.info("ClickHouse returned %d rows for since=%s", len(rows), since_expr)
-        return _build_evidence(rows)
-
-    except Exception as exc:
-        _log.warning("ClickHouse query failed: %s", exc)
+    rows = _run_query(url, sql, username, password)
+    if rows is None:
         return None
+    if not rows:
+        return {"source": "clickhouse", "no_data": True}
+    return _build_evidence(rows)
 
 
 def _build_evidence(rows: list[dict]) -> dict:

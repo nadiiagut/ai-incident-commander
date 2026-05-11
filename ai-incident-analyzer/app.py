@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import clickhouse_client
@@ -21,6 +22,20 @@ IPINFO_TOKEN: str = os.getenv("IPINFO_TOKEN", "")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ai-incident-analyzer")
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    log.info(
+        "Config | CLICKHOUSE_URL=%r  database=%r  table=%r  username=%r  password_set=%s",
+        CLICKHOUSE_URL, CLICKHOUSE_DATABASE, CLICKHOUSE_TABLE,
+        CLICKHOUSE_USERNAME, bool(CLICKHOUSE_PASSWORD),
+    )
+    log.info(
+        "Config | OPENAI_MODEL=%r  openai_key_set=%s  ipinfo_token_set=%s",
+        OPENAI_MODEL, bool(OPENAI_API_KEY), bool(IPINFO_TOKEN),
+    )
+    yield
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
@@ -88,6 +103,14 @@ def _fetch_log_evidence(service: str) -> dict:
     Try ClickHouse first; fall back to static mock when unavailable.
     Adds IPinfo enrichment for unique client IPs when ClickHouse returns rows.
     """
+    if not CLICKHOUSE_URL:
+        log.warning("CLICKHOUSE_URL is empty — skipping live query, using mock evidence")
+        return _mock_evidence(service)
+
+    log.info(
+        "Fetching log evidence | url=%s db=%s table=%s username=%r",
+        CLICKHOUSE_URL, CLICKHOUSE_DATABASE, CLICKHOUSE_TABLE, CLICKHOUSE_USERNAME,
+    )
     evidence = clickhouse_client.fetch_evidence(
         query_url=CLICKHOUSE_URL,
         database=CLICKHOUSE_DATABASE,
@@ -97,11 +120,14 @@ def _fetch_log_evidence(service: str) -> dict:
     )
 
     if evidence is None:
-        log.info("ClickHouse unavailable — using mocked evidence")
+        log.warning(
+            "ClickHouse query failed — using mock evidence "
+            "(check logs above for HTTP status / error body)"
+        )
         return _mock_evidence(service)
 
     if evidence.get("no_data"):
-        log.info("No matching logs in ClickHouse (last 10 min, /checkout, status>=500)")
+        log.info("ClickHouse: query OK but 0 rows match (last 10 min, /checkout, status>=500)")
         evidence["enrichment"] = {"available": False, "reason": "No matching log evidence found in ClickHouse"}
         return evidence
 
@@ -361,6 +387,7 @@ app = FastAPI(
     title="AI Incident Analyzer",
     description="Analyses Grafana alerts with live ClickHouse evidence and IPinfo enrichment to produce Jira Bug reports.",
     version="2.0.0",
+    lifespan=_lifespan,
 )
 
 
@@ -380,6 +407,11 @@ def analyze_incident(alert: AlertPayload) -> IncidentAnalysis:
 
     evidence = _fetch_log_evidence(alert.service)
     incident_started_at = evidence.get("first_seen") or alert.starts_at or "unknown"
+    log.info(
+        "Evidence source=%s  first_seen=%r  failed_count=%s  incident_started_at=%r",
+        evidence.get("source"), evidence.get("first_seen"),
+        evidence.get("failed_request_count", "n/a"), incident_started_at,
+    )
 
     if alert.demo_mode:
         log.info("demo_mode=True — returning fallback analysis")
