@@ -80,6 +80,7 @@ class MonitorEvidence(BaseModel):
 
     total_failed_requests_since_incident_start: int
     failed_requests_last_5m: int
+    first_seen: str
     latest_failed_request: str
     dominant_error: str
     top_country: str
@@ -474,6 +475,7 @@ def _monitor_failed(req: MonitorRequest, reason: str) -> MonitorResponse:
         jira_comment=_build_jira_comment("monitoring_failed", MonitorEvidence(
             total_failed_requests_since_incident_start=0,
             failed_requests_last_5m=0,
+            first_seen="",
             latest_failed_request="",
             dominant_error="",
             top_country="",
@@ -482,6 +484,7 @@ def _monitor_failed(req: MonitorRequest, reason: str) -> MonitorResponse:
         evidence=MonitorEvidence(
             total_failed_requests_since_incident_start=0,
             failed_requests_last_5m=0,
+            first_seen="",
             latest_failed_request="",
             dominant_error="",
             top_country="",
@@ -593,9 +596,12 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
     status = "still_failing" if last_5m > 0 else "recovered"
     log.info("Monitor result: %s | last5m=%d total=%d", status, last_5m, total_failed)
 
+    first_seen = "" if full_ev.get("no_data") else full_ev.get("first_seen", "")
+
     evidence = MonitorEvidence(
         total_failed_requests_since_incident_start=total_failed,
         failed_requests_last_5m=last_5m,
+        first_seen=first_seen,
         latest_failed_request=latest_ts,
         dominant_error=dominant_error,
         top_country=top_country,

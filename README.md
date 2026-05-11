@@ -318,7 +318,7 @@ Expected:
 }
 ```
 
-### Response fields
+### Response fields — `/analyze-incident`
 
 | Field | Description |
 |-------|-------------|
@@ -329,6 +329,22 @@ Expected:
 | `immediate_actions` | Ordered remediation steps |
 | `jira_incident_title` | Ready-to-use Jira Bug title |
 | `jira_incident_description` | Full Jira wiki markup including log evidence and geographic impact |
+
+### Response fields — `/monitor-incident`
+
+| Field | Description |
+|-------|-------------|
+| `jira_issue_key` | Echoed from request |
+| `incident_status` | `still_failing` · `recovered` · `monitoring_failed` |
+| `status_summary` | One-sentence plain-text status for display |
+| `jira_comment` | Ready-to-post Jira comment in wiki markup |
+| `evidence.total_failed_requests_since_incident_start` | Count of 5xx rows from `incident_started_at` until now |
+| `evidence.failed_requests_last_5m` | Count of 5xx rows in the last 5 minutes |
+| `evidence.first_seen` | Earliest 5xx timestamp since incident start |
+| `evidence.latest_failed_request` | Most recent 5xx timestamp since incident start |
+| `evidence.dominant_error` | Most frequent error string |
+| `evidence.top_country` | Top affected country from IPinfo (empty if unavailable) |
+| `evidence.top_asn` | Top affected ASN from IPinfo (empty if unavailable) |
 
 ### Evidence pipeline
 
