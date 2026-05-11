@@ -222,27 +222,137 @@ def _build_user_message(alert: AlertPayload, evidence: dict) -> str:
     )
 
 
+# ── Jira description builder ──────────────────────────────────────────────────
+
+def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -> str:
+    """
+    Build Jira wiki-markup description using real evidence when available,
+    degrading gracefully when ClickHouse or IPinfo data is absent.
+    """
+    has_live = evidence.get("source") == "clickhouse" and not evidence.get("no_data")
+
+    header = (
+        "h2. Incident Summary\n\n"
+        f"*Alert:* {alert.alert_name}\n"
+        f"*Service:* {alert.service}\n"
+        f"*Severity:* {alert.severity}\n"
+        f"*Started:* {started}\n"
+        f"*Dashboard:* {alert.dashboard_url or 'N/A'}\n\n"
+    )
+
+    if has_live:
+        count = evidence.get("failed_request_count", 0)
+        first = evidence.get("first_seen") or "N/A"
+        latest = evidence.get("latest_seen") or "N/A"
+        dominant = evidence.get("dominant_error") or "N/A"
+        versions = ", ".join(evidence.get("deployment_versions", [])) or "N/A"
+
+        ip_counts: dict = evidence.get("ip_counts", {})
+        top_ips = sorted(ip_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+        ip_lines = "\n".join(f"* {ip} ({cnt} req)" for ip, cnt in top_ips) or "* N/A"
+
+        ev_section = (
+            "h2. Log Evidence\n\n"
+            "*Source:* ClickHouse (live)\n"
+            f"*Failed Requests:* {count}\n"
+            f"*First Seen:* {first}\n"
+            f"*Latest Seen:* {latest}\n"
+            f"*Dominant Error:* {dominant}\n"
+            f"*Deployment Versions:* {versions}\n\n"
+            "h3. Top Client IPs\n\n"
+            f"{ip_lines}\n\n"
+        )
+
+        sample: list[dict] = evidence.get("recent_sample", [])
+        if sample:
+            table = "|| Timestamp || Status || Error || Version ||\n"
+            for row in sample[:5]:
+                ts = row.get("event_timestamp") or "N/A"
+                sc = row.get("status_code", "N/A")
+                err = str(row.get("error") or "N/A")[:60]
+                ver = row.get("deployment_version") or "N/A"
+                table += f"| {ts} | {sc} | {err} | {ver} |\n"
+            ev_section += f"h3. Recent Failed Requests\n\n{table}\n"
+    else:
+        ev_section = (
+            "h2. Log Evidence\n\n"
+            "_Live ClickHouse evidence not available — see Grafana dashboard for current metrics._\n\n"
+        )
+
+    enrichment: dict = evidence.get("enrichment", {})
+    if enrichment.get("available") is not False and enrichment:
+        countries: dict = enrichment.get("failures_by_country", {})
+        country_lines = "\n".join(
+            f"* {c}: {n} req"
+            for c, n in sorted(countries.items(), key=lambda x: x[1], reverse=True)[:5]
+        ) or "* N/A"
+        top_asn = enrichment.get("top_affected_asn") or "N/A"
+        scope = enrichment.get("impact_scope") or "N/A"
+        geo_section = (
+            "h2. Geographic Impact\n\n"
+            f"*Impact Scope:* {scope}\n"
+            f"*Top Affected ASN:* {top_asn}\n\n"
+            "h3. Failures by Country\n\n"
+            f"{country_lines}\n\n"
+        )
+    elif has_live:
+        geo_section = (
+            "h2. Geographic Impact\n\n"
+            "_IPinfo enrichment unavailable — raw client IP evidence is included above._\n\n"
+        )
+    else:
+        geo_section = "h2. Geographic Impact\n\n_IPinfo enrichment not available._\n\n"
+
+    actions = "h2. Actions Taken\n\n* _To be filled by on-call engineer_"
+    return header + ev_section + geo_section + actions
+
+
 # ── Safe fallback ────────────────────────────────────────────────────────────────
 
-def _fallback(alert: AlertPayload, incident_started_at: str = "") -> IncidentAnalysis:
+def _fallback(
+    alert: AlertPayload,
+    incident_started_at: str = "",
+    evidence: dict | None = None,
+) -> IncidentAnalysis:
     """
     Deterministic response used when:
     - demo_mode is True
     - OPENAI_API_KEY is absent
     - The LLM call fails for any reason
+    Always uses real evidence when available.
     """
     started = incident_started_at or alert.starts_at or "unknown"
-    return IncidentAnalysis(
-        incident_started_at=started,
-        incident_summary=(
+    ev = evidence or {}
+    has_live = ev.get("source") == "clickhouse" and not ev.get("no_data")
+
+    if has_live:
+        count = ev.get("failed_request_count", 0)
+        dominant = ev.get("dominant_error") or "unknown"
+        incident_summary = (
+            f"Alert '{alert.alert_name}' is firing for service '{alert.service}' "
+            f"with severity {alert.severity}. "
+            f"{count} failed /checkout requests observed since {started}. "
+            f"Dominant error: {dominant}."
+        )
+        probable_root_cause = (
+            f"Live ClickHouse evidence shows {count} failed requests with dominant error '{dominant}'. "
+            "Review recent deployments and downstream dependencies for the root cause."
+        )
+    else:
+        incident_summary = (
             f"Alert '{alert.alert_name}' is firing for service '{alert.service}' "
             f"with severity {alert.severity}. "
             "HTTP 500 errors detected on the /checkout endpoint."
-        ),
-        probable_root_cause=(
+        )
+        probable_root_cause = (
             "A recent deployment introduced a regression in the payment gateway client. "
             "All checkout requests are failing with payment_gateway_timeout."
-        ),
+        )
+
+    return IncidentAnalysis(
+        incident_started_at=started,
+        incident_summary=incident_summary,
+        probable_root_cause=probable_root_cause,
         customer_impact=(
             "Checkout attempts are failing. Customers cannot complete purchases. "
             "Revenue impact grows linearly until the incident is resolved."
@@ -255,26 +365,14 @@ def _fallback(alert: AlertPayload, incident_started_at: str = "") -> IncidentAna
             "Monitor error rate after rollback to confirm resolution",
         ],
         jira_incident_title=f"[INCIDENT] {alert.alert_name} — {alert.service} checkout failures",
-        jira_incident_description=(
-            "h2. Incident Summary\n\n"
-            f"*Alert:* {alert.alert_name}\n"
-            f"*Service:* {alert.service}\n"
-            f"*Severity:* {alert.severity}\n"
-            f"*Started:* {started}\n"
-            f"*Dashboard:* {alert.dashboard_url or 'N/A'}\n\n"
-            "h2. Log Evidence\n\n"
-            "_Live ClickHouse evidence not available — see Grafana dashboard for current metrics._\n\n"
-            "h2. Geographic Impact\n\n"
-            "_IPinfo enrichment not available._\n\n"
-            "h2. Actions Taken\n\n"
-            "* _To be filled by on-call engineer_"
-        ),
+        jira_incident_description=_build_jira_description(alert, ev, started),
     )
 
 
 # ── OpenAI call ────────────────────────────────────────────────────────────────
 
 def _call_openai(alert: AlertPayload, evidence: dict) -> IncidentAnalysis:
+    log.info("Calling OpenAI model=%s for alert=%s", OPENAI_MODEL, alert.alert_name)
     client = OpenAI(api_key=OPENAI_API_KEY)
     completion = client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -287,6 +385,7 @@ def _call_openai(alert: AlertPayload, evidence: dict) -> IncidentAnalysis:
         timeout=25,
     )
     raw = completion.choices[0].message.content
+    log.info("OpenAI response received (%d chars)", len(raw or ""))
     return IncidentAnalysis(**json.loads(raw))
 
 
@@ -408,26 +507,29 @@ def analyze_incident(alert: AlertPayload) -> IncidentAnalysis:
     evidence = _fetch_log_evidence(alert.service)
     incident_started_at = evidence.get("first_seen") or alert.starts_at or "unknown"
     log.info(
-        "Evidence source=%s  first_seen=%r  failed_count=%s  incident_started_at=%r",
-        evidence.get("source"), evidence.get("first_seen"),
-        evidence.get("failed_request_count", "n/a"), incident_started_at,
+        "Evidence source=%s  failed_count=%s  dominant_error=%r  first_seen=%r  incident_started_at=%r",
+        evidence.get("source"),
+        evidence.get("failed_request_count", "n/a"),
+        evidence.get("dominant_error", "n/a"),
+        evidence.get("first_seen"),
+        incident_started_at,
     )
 
     if alert.demo_mode:
-        log.info("demo_mode=True — returning fallback analysis")
-        return _fallback(alert, incident_started_at)
+        log.info("demo_mode=True — using fallback with live evidence")
+        return _fallback(alert, incident_started_at, evidence)
 
     if not OPENAI_API_KEY:
-        log.warning("OPENAI_API_KEY not set — returning fallback analysis")
-        return _fallback(alert, incident_started_at)
+        log.warning("OPENAI_API_KEY not set — using fallback with live evidence")
+        return _fallback(alert, incident_started_at, evidence)
 
     try:
         result = _call_openai(alert, evidence)
-        log.info("OpenAI analysis complete for alert: %s", alert.alert_name)
+        log.info("Response generated by OpenAI for alert: %s", alert.alert_name)
         return result
     except Exception as exc:
-        log.error("OpenAI call failed (%s) — returning fallback analysis", exc)
-        return _fallback(alert, incident_started_at)
+        log.error("OpenAI call failed (%s) — using fallback with live evidence", exc)
+        return _fallback(alert, incident_started_at, evidence)
 
 
 @app.post(
