@@ -88,6 +88,7 @@ class MonitorEvidence(BaseModel):
     top_country: str
     top_asn: str
     follow_up_count: int = Field(default=1, description="Echoed from request for n8n loop tracking")
+    impact_pattern: str = Field(default="", description="IPinfo-derived impact pattern description")
 
 
 class MonitorResponse(BaseModel):
@@ -229,6 +230,19 @@ def _build_user_message(alert: AlertPayload, evidence: dict) -> str:
 
 # ── Jira description builder ──────────────────────────────────────────────────
 
+def _format_asn_line(d: dict) -> str:
+    """Render one ASN detail entry as a plain-text bullet."""
+    parts = [d["asn"]]
+    if d.get("as_name"):
+        parts.append(d["as_name"])
+    if d.get("as_domain"):
+        parts.append(d["as_domain"])
+    n = d["count"]
+    label = " \u2014 ".join(parts)
+    suffix = "s" if n != 1 else ""
+    return f"- {label}: {n} failed request{suffix}"
+
+
 def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -> str:
     """
     Build plain-text Jira description using real evidence when available,
@@ -292,25 +306,37 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
     enrichment: dict = evidence.get("enrichment", {})
     if enrichment.get("available") is not False and enrichment:
         countries: dict = enrichment.get("failures_by_country", {})
+        country_names: dict = enrichment.get("country_names", {})
         country_lines = "\n".join(
-            f"- {c}: {n} req"
+            f"- {country_names.get(c, c)}: {n} failed request{'s' if n != 1 else ''}"
             for c, n in sorted(countries.items(), key=lambda x: x[1], reverse=True)[:5]
         ) or "- N/A"
-        top_asn = enrichment.get("top_affected_asn") or "N/A"
-        scope = enrichment.get("impact_scope") or "N/A"
+
+        asn_details: list = enrichment.get("asn_details", [])
+        if asn_details:
+            asn_lines = "\n".join(_format_asn_line(d) for d in asn_details[:5])
+        else:
+            asns: dict = enrichment.get("failures_by_asn", {})
+            asn_lines = "\n".join(
+                f"- {a}: {n} failed request{'s' if n != 1 else ''}"
+                for a, n in sorted(asns.items(), key=lambda x: x[1], reverse=True)[:5]
+            ) or "- N/A"
+
+        impact_pattern = enrichment.get("impact_pattern", "")
+
         geo_section = (
-            "\nGeographic Impact\n\n"
-            f"Impact Scope: {scope}\n"
-            f"Top Affected ASN: {top_asn}\n\n"
-            f"Failures by Country:\n{country_lines}\n"
+            "\nImpact Analysis by IPinfo Lite\n\n"
+            f"Affected countries:\n{country_lines}\n\n"
+            f"Affected networks / ASNs:\n{asn_lines}\n\n"
+            f"Impact pattern:\n{impact_pattern}\n"
         )
     elif has_live:
         geo_section = (
-            "\nGeographic Impact\n\n"
+            "\nImpact Analysis by IPinfo Lite\n\n"
             "IPinfo enrichment unavailable. Raw client IP evidence is included above.\n"
         )
     else:
-        geo_section = "\nGeographic Impact\n\nIPinfo enrichment not available.\n"
+        geo_section = "\nImpact Analysis by IPinfo Lite\n\nIPinfo enrichment not available.\n"
 
     b2 = (
         f"Compare failure start time with deployment {deploy_ref}."
@@ -443,15 +469,38 @@ def _build_status_summary(status: str, ev: MonitorEvidence, req: MonitorRequest)
     return f"Automated monitoring failed for incident {req.jira_issue_key}."
 
 
-def _build_jira_comment(status: str, ev: MonitorEvidence, req: MonitorRequest) -> str:
+def _build_jira_comment(
+    status: str,
+    ev: MonitorEvidence,
+    req: MonitorRequest,
+    enrich_summary: dict | None = None,
+) -> str:
     header = (
         f"AI Incident Monitor \u2014 {req.jira_issue_key}\n\n"
         f"Follow-up check: {req.follow_up_count}/{req.max_followups}\n"
     )
 
+    ipinfo_block = ""
+    if enrich_summary and enrich_summary.get("available"):
+        top_cname = enrich_summary.get("top_country_name") or ev.top_country or "N/A"
+        top_ccnt = enrich_summary.get("top_country_count", 0)
+        top_asn = enrich_summary.get("top_affected_asn") or "N/A"
+        top_asn_name = enrich_summary.get("top_asn_name") or ""
+        top_asn_domain = enrich_summary.get("top_asn_domain") or ""
+        pattern = enrich_summary.get("impact_pattern") or ""
+        net_parts = [p for p in [top_asn, top_asn_name, top_asn_domain] if p]
+        net_label = " \u2014 ".join(net_parts)
+        req_word = "request" if top_ccnt == 1 else "requests"
+        ipinfo_block = (
+            "\nIPinfo impact:\n"
+            f"Top country: {top_cname} \u2014 {top_ccnt} failed {req_word}\n"
+            f"Top network: {net_label}\n"
+            f"Impact pattern: {pattern}\n"
+        )
+
     if status == "still_failing":
         geo = ""
-        if ev.top_country or ev.top_asn:
+        if not ipinfo_block and (ev.top_country or ev.top_asn):
             geo = (
                 f"Top affected country: {ev.top_country or 'N/A'}\n"
                 f"Top affected ASN: {ev.top_asn or 'N/A'}\n"
@@ -464,6 +513,7 @@ def _build_jira_comment(status: str, ev: MonitorEvidence, req: MonitorRequest) -
             + f"Dominant error: {ev.dominant_error or 'N/A'}\n"
             + f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
             + geo
+            + ipinfo_block
             + "\nThe workflow will continue monitoring unless the incident recovers "
             + "or the maximum follow-up count is reached."
         )
@@ -474,8 +524,9 @@ def _build_jira_comment(status: str, ev: MonitorEvidence, req: MonitorRequest) -
             + "Status: No new failures observed\n\n"
             + f"No new {req.endpoint} 5xx responses were observed in the last 5 minutes.\n\n"
             + f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
-            + f"Total since incident start: {ev.total_failed_requests_since_incident_start}\n\n"
-            + "The incident appears mitigated. Automated monitoring for this incident is ending.\n\n"
+            + f"Total since incident start: {ev.total_failed_requests_since_incident_start}\n"
+            + ipinfo_block
+            + "\nThe incident appears mitigated. Automated monitoring for this incident is ending.\n\n"
             + "No automated Jira transition was performed. Verify manually before closing."
         )
 
@@ -606,6 +657,7 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
     latest_ts = "" if full_ev.get("no_data") else full_ev.get("latest_seen", "")
     dominant_error = "" if full_ev.get("no_data") else full_ev.get("dominant_error", "")
 
+    enrich_summary: dict | None = None
     top_country = ""
     top_asn = ""
     if not full_ev.get("no_data") and full_ev.get("unique_ips"):
@@ -619,6 +671,7 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
     log.info("Monitor result: %s | last5m=%d total=%d", status, last_5m, total_failed)
 
     first_seen = "" if full_ev.get("no_data") else full_ev.get("first_seen", "")
+    impact_pattern = (enrich_summary or {}).get("impact_pattern", "")
 
     evidence = MonitorEvidence(
         total_failed_requests_since_incident_start=total_failed,
@@ -629,11 +682,12 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
         top_country=top_country,
         top_asn=top_asn,
         follow_up_count=req.follow_up_count,
+        impact_pattern=impact_pattern,
     )
     return MonitorResponse(
         jira_issue_key=req.jira_issue_key,
         incident_status=status,
         status_summary=_build_status_summary(status, evidence, req),
-        jira_comment=_build_jira_comment(status, evidence, req),
+        jira_comment=_build_jira_comment(status, evidence, req, enrich_summary),
         evidence=evidence,
     )
