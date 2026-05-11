@@ -231,6 +231,9 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
     degrading gracefully when ClickHouse or IPinfo data is absent.
     """
     has_live = evidence.get("source") == "clickhouse" and not evidence.get("no_data")
+    deploy_ref = (
+        ", ".join(evidence.get("deployment_versions", [])) or None
+    ) if has_live else None
 
     header = (
         "h2. Incident Summary\n\n"
@@ -307,9 +310,14 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
     else:
         geo_section = "h2. Geographic Impact\n\n_IPinfo enrichment not available._\n\n"
 
+    deploy_bullet = (
+        f"Validate whether failures started after deployment {deploy_ref}."
+        if deploy_ref else
+        "Validate whether failures started after the listed deployment version."
+    )
     actions = (
         "h2. Recommended Immediate Actions\n\n"
-        "* Validate whether the issue started after the listed deployment version.\n"
+        f"* {deploy_bullet}\n"
         "* Check payment gateway connectivity and timeout configuration.\n"
         "* Roll back or disable the affected checkout path if failures continue.\n"
         "* Monitor checkout 5xx rate in Grafana after mitigation.\n"
