@@ -303,7 +303,14 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
     else:
         geo_section = "h2. Geographic Impact\n\n_IPinfo enrichment not available._\n\n"
 
-    actions = "h2. Actions Taken\n\n* _To be filled by on-call engineer_"
+    actions = (
+        "h2. Recommended Immediate Actions\n\n"
+        "* Validate whether the issue started after the listed deployment version.\n"
+        "* Check payment gateway connectivity and timeout configuration.\n"
+        "* Roll back or disable the affected checkout path if failures continue.\n"
+        "* Monitor checkout 5xx rate in Grafana after mitigation.\n"
+        "* Keep this Jira Bug updated with automated follow-up evidence."
+    )
     return header + ev_section + geo_section + actions
 
 
