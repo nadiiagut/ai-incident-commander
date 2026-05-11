@@ -73,6 +73,8 @@ class MonitorRequest(BaseModel):
     incident_started_at: str = Field(..., description="ISO 8601 incident start timestamp")
     jira_issue_key: str = Field(..., description="Jira issue key, e.g. INC-42")
     alert_name: str = Field(default="", description="Original Grafana alert name")
+    follow_up_count: int = Field(default=1, description="Current follow-up iteration (1-based)")
+    max_followups: int = Field(default=3, description="Maximum number of follow-up checks")
 
 
 class MonitorEvidence(BaseModel):
@@ -85,6 +87,7 @@ class MonitorEvidence(BaseModel):
     dominant_error: str
     top_country: str
     top_asn: str
+    follow_up_count: int = Field(default=1, description="Echoed from request for n8n loop tracking")
 
 
 class MonitorResponse(BaseModel):
@@ -441,7 +444,10 @@ def _build_status_summary(status: str, ev: MonitorEvidence, req: MonitorRequest)
 
 
 def _build_jira_comment(status: str, ev: MonitorEvidence, req: MonitorRequest) -> str:
-    header = f"AI Incident Monitor \u2014 {req.jira_issue_key}\n\n"
+    header = (
+        f"AI Incident Monitor \u2014 {req.jira_issue_key}\n\n"
+        f"Follow-up check: {req.follow_up_count}/{req.max_followups}\n"
+    )
 
     if status == "still_failing":
         geo = ""
@@ -458,7 +464,8 @@ def _build_jira_comment(status: str, ev: MonitorEvidence, req: MonitorRequest) -
             + f"Dominant error: {ev.dominant_error or 'N/A'}\n"
             + f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
             + geo
-            + "\nNo automated Jira transition was performed. Manual mitigation is still required."
+            + "\nThe workflow will continue monitoring unless the incident recovers "
+            + "or the maximum follow-up count is reached."
         )
 
     if status == "recovered":
@@ -468,7 +475,7 @@ def _build_jira_comment(status: str, ev: MonitorEvidence, req: MonitorRequest) -
             + f"No new {req.endpoint} 5xx responses were observed in the last 5 minutes.\n\n"
             + f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
             + f"Total since incident start: {ev.total_failed_requests_since_incident_start}\n\n"
-            + "The incident appears mitigated but should continue to be monitored before closure.\n\n"
+            + "The incident appears mitigated. Automated monitoring for this incident is ending.\n\n"
             + "No automated Jira transition was performed. Verify manually before closing."
         )
 
@@ -493,6 +500,7 @@ def _monitor_failed(req: MonitorRequest, reason: str) -> MonitorResponse:
             dominant_error="",
             top_country="",
             top_asn="",
+            follow_up_count=req.follow_up_count,
         ), req),
         evidence=MonitorEvidence(
             total_failed_requests_since_incident_start=0,
@@ -502,6 +510,7 @@ def _monitor_failed(req: MonitorRequest, reason: str) -> MonitorResponse:
             dominant_error="",
             top_country="",
             top_asn="",
+            follow_up_count=req.follow_up_count,
         ),
     )
 
@@ -619,6 +628,7 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
         dominant_error=dominant_error,
         top_country=top_country,
         top_asn=top_asn,
+        follow_up_count=req.follow_up_count,
     )
     return MonitorResponse(
         jira_issue_key=req.jira_issue_key,
