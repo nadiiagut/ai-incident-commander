@@ -217,7 +217,8 @@ def _build_user_message(alert: AlertPayload, evidence: dict) -> str:
         '  "jira_incident_description": "Jira wiki markup. Must include sections: Incident Summary '
         '(alert metadata), Log Evidence (failed_request_count, first_seen, latest_seen, dominant_error, '
         'deployment_version), Geographic Impact (top countries and ASNs from enrichment, or N/A), '
-        'Recent Log Sample (table of last 5 rows), Actions Taken (placeholder)"\n'
+        'Recent Log Sample (last 5 rows as bullets), Recommended Immediate Actions '
+        '(evidence-driven: mention deployment version and dominant error)"\n'
         "}\n\n"
         "Return ONLY the JSON object. No markdown fences, no extra text."
     )
@@ -234,6 +235,7 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
     deploy_ref = (
         ", ".join(evidence.get("deployment_versions", [])) or None
     ) if has_live else None
+    dominant_ref = (evidence.get("dominant_error") or None) if has_live else None
 
     header = (
         "h2. Incident Summary\n\n"
@@ -310,17 +312,30 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
     else:
         geo_section = "h2. Geographic Impact\n\n_IPinfo enrichment not available._\n\n"
 
-    deploy_bullet = (
-        f"Validate whether failures started after deployment {deploy_ref}."
+    b1 = (
+        f"Validate whether failures started after deployment *{deploy_ref}*."
         if deploy_ref else
-        "Validate whether failures started after the listed deployment version."
+        "Validate whether failures coincide with a recent deployment."
+    )
+    b2 = (
+        f"Investigate root cause of *{dominant_ref}* — check application logs "
+        "and downstream service health."
+        if dominant_ref else
+        "Investigate the dominant error type — review application logs and "
+        "downstream service health."
+    )
+    b3 = (
+        f"Roll back *{deploy_ref}* or disable the affected checkout path if "
+        "failures continue."
+        if deploy_ref else
+        "Roll back or disable the affected checkout path if failures continue."
     )
     actions = (
         "h2. Recommended Immediate Actions\n\n"
-        f"* {deploy_bullet}\n"
-        "* Check payment gateway connectivity and timeout configuration.\n"
-        "* Roll back or disable the affected checkout path if failures continue.\n"
-        "* Monitor checkout 5xx rate in Grafana after mitigation.\n"
+        f"* {b1}\n"
+        f"* {b2}\n"
+        f"* {b3}\n"
+        "* Monitor checkout 5xx rate in Grafana after each mitigation step.\n"
         "* Keep this Jira Bug updated with automated follow-up evidence."
     )
     return header + ev_section + geo_section + actions
