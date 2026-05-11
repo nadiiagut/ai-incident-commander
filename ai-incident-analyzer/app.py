@@ -265,14 +265,17 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
 
         sample: list[dict] = evidence.get("recent_sample", [])
         if sample:
-            table = "|| Timestamp || Status || Error || Version ||\n"
+            bullets = ""
             for row in sample[:5]:
                 ts = row.get("event_timestamp") or "N/A"
+                ip = row.get("client_ip") or "N/A"
+                ep = row.get("endpoint") or "N/A"
                 sc = row.get("status_code", "N/A")
                 err = str(row.get("error") or "N/A")[:60]
                 ver = row.get("deployment_version") or "N/A"
-                table += f"| {ts} | {sc} | {err} | {ver} |\n"
-            ev_section += f"h3. Recent Failed Requests\n\n{table}\n"
+                lat = row.get("response_time_ms", "N/A")
+                bullets += f"* {ts} | {ip} | {ep} | {sc} | {err} | deployment={ver} | latency={lat}ms\n"
+            ev_section += f"h3. Recent Failed Requests\n\n{bullets}\n"
     else:
         ev_section = (
             "h2. Log Evidence\n\n"
