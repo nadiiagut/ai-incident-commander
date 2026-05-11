@@ -84,7 +84,7 @@ def fetch_evidence(
 
     sql = (
         f"SELECT "
-        f"toString(timestamp) AS timestamp, "
+        f"toString(timestamp) AS event_timestamp, "
         f"request_id, "
         f"client_ip, "
         f"endpoint, "
@@ -135,7 +135,7 @@ def fetch_since(
 
     sql = (
         f"SELECT "
-        f"toString(timestamp) AS timestamp, "
+        f"toString(timestamp) AS event_timestamp, "
         f"request_id, "
         f"client_ip, "
         f"endpoint, "
@@ -162,7 +162,7 @@ def fetch_since(
 
 
 def _build_evidence(rows: list[dict]) -> dict:
-    timestamps = sorted(r["timestamp"] for r in rows if r.get("timestamp"))
+    timestamps = sorted(r["event_timestamp"] for r in rows if r.get("event_timestamp"))
     first_seen = timestamps[0] if timestamps else ""
     latest_seen = timestamps[-1] if timestamps else ""
 
