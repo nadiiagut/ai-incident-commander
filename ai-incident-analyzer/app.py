@@ -278,7 +278,7 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
                 err = str(row.get("error") or "N/A")[:60]
                 ver = row.get("deployment_version") or "N/A"
                 lat = row.get("response_time_ms", "N/A")
-                bullets += f"* {ts} | {ip} | {ep} | {sc} | {err} | deployment={ver} | latency={lat}ms\n"
+                bullets += f"* {ts} | ip={ip} | endpoint={ep} | status={sc} | error={err} | deployment={ver} | latency={lat}ms\n"
             ev_section += f"h3. Recent Failed Requests\n\n{bullets}\n"
     else:
         ev_section = (
