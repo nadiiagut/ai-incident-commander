@@ -228,8 +228,9 @@ def _build_user_message(alert: AlertPayload, evidence: dict) -> str:
 
 def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -> str:
     """
-    Build Jira wiki-markup description using real evidence when available,
+    Build plain-text Jira description using real evidence when available,
     degrading gracefully when ClickHouse or IPinfo data is absent.
+    No wiki markup, no heading markers, no bold/italic tokens.
     """
     has_live = evidence.get("source") == "clickhouse" and not evidence.get("no_data")
     deploy_ref = (
@@ -238,12 +239,12 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
     dominant_ref = (evidence.get("dominant_error") or None) if has_live else None
 
     header = (
-        "h2. Incident Summary\n\n"
-        f"*Alert:* {alert.alert_name}\n"
-        f"*Service:* {alert.service}\n"
-        f"*Severity:* {alert.severity}\n"
-        f"*Started:* {started}\n"
-        f"*Dashboard:* {alert.dashboard_url or 'N/A'}\n\n"
+        "Incident Summary\n\n"
+        f"Alert: {alert.alert_name}\n"
+        f"Service: {alert.service}\n"
+        f"Severity: {alert.severity}\n"
+        f"Started: {started}\n"
+        f"Dashboard: {alert.dashboard_url or 'N/A'}\n"
     )
 
     if has_live:
@@ -255,88 +256,84 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
 
         ip_counts: dict = evidence.get("ip_counts", {})
         top_ips = sorted(ip_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        ip_lines = "\n".join(f"* {ip} ({cnt} req)" for ip, cnt in top_ips) or "* N/A"
+        ip_lines = "\n".join(f"- {ip} ({cnt} req)" for ip, cnt in top_ips) or "- N/A"
 
         ev_section = (
-            "h2. Log Evidence\n\n"
-            "*Source:* ClickHouse (live)\n"
-            f"*Failed Requests:* {count}\n"
-            f"*First Seen:* {first}\n"
-            f"*Latest Seen:* {latest}\n"
-            f"*Dominant Error:* {dominant}\n"
-            f"*Deployment Versions:* {versions}\n\n"
-            "h3. Top Client IPs\n\n"
-            f"{ip_lines}\n\n"
+            "\nLog Evidence\n\n"
+            "Source: ClickHouse (live)\n"
+            f"Failed Requests: {count}\n"
+            f"First Seen: {first}\n"
+            f"Latest Seen: {latest}\n"
+            f"Dominant Error: {dominant}\n"
+            f"Deployment: {versions}\n\n"
+            f"Top Client IPs:\n{ip_lines}\n"
         )
 
         sample: list[dict] = evidence.get("recent_sample", [])
         if sample:
             bullets = ""
-            for row in sample[:5]:
+            for row in sample[:3]:
                 ts = row.get("event_timestamp") or "N/A"
                 ip = row.get("client_ip") or "N/A"
-                ep = row.get("endpoint") or "N/A"
                 sc = row.get("status_code", "N/A")
                 err = str(row.get("error") or "N/A")[:60]
-                ver = row.get("deployment_version") or "N/A"
                 lat = row.get("response_time_ms", "N/A")
-                bullets += f"* {ts} | ip={ip} | endpoint={ep} | status={sc} | error={err} | deployment={ver} | latency={lat}ms\n"
-            ev_section += f"h3. Recent Failed Requests\n\n{bullets}\n"
+                bullets += f"- {ts} | ip={ip} | status={sc} | error={err} | latency={lat}ms\n"
+            ev_section += f"\nRecent Failed Requests:\n{bullets}"
     else:
         ev_section = (
-            "h2. Log Evidence\n\n"
-            "_Live ClickHouse evidence not available — see Grafana dashboard for current metrics._\n\n"
+            "\nLog Evidence\n\n"
+            "Live ClickHouse evidence not available. See Grafana dashboard for current metrics.\n"
         )
 
     enrichment: dict = evidence.get("enrichment", {})
     if enrichment.get("available") is not False and enrichment:
         countries: dict = enrichment.get("failures_by_country", {})
         country_lines = "\n".join(
-            f"* {c}: {n} req"
+            f"- {c}: {n} req"
             for c, n in sorted(countries.items(), key=lambda x: x[1], reverse=True)[:5]
-        ) or "* N/A"
+        ) or "- N/A"
         top_asn = enrichment.get("top_affected_asn") or "N/A"
         scope = enrichment.get("impact_scope") or "N/A"
         geo_section = (
-            "h2. Geographic Impact\n\n"
-            f"*Impact Scope:* {scope}\n"
-            f"*Top Affected ASN:* {top_asn}\n\n"
-            "h3. Failures by Country\n\n"
-            f"{country_lines}\n\n"
+            "\nGeographic Impact\n\n"
+            f"Impact Scope: {scope}\n"
+            f"Top Affected ASN: {top_asn}\n\n"
+            f"Failures by Country:\n{country_lines}\n"
         )
     elif has_live:
         geo_section = (
-            "h2. Geographic Impact\n\n"
-            "_IPinfo enrichment unavailable — raw client IP evidence is included above._\n\n"
+            "\nGeographic Impact\n\n"
+            "IPinfo enrichment unavailable. Raw client IP evidence is included above.\n"
         )
     else:
-        geo_section = "h2. Geographic Impact\n\n_IPinfo enrichment not available._\n\n"
+        geo_section = "\nGeographic Impact\n\nIPinfo enrichment not available.\n"
 
     b1 = (
-        f"Validate whether failures started after deployment *{deploy_ref}*."
+        f"Validate whether failures started after deployment {deploy_ref}."
         if deploy_ref else
         "Validate whether failures coincide with a recent deployment."
     )
     b2 = (
-        f"Investigate root cause of *{dominant_ref}* — check application logs "
+        f"Investigate root cause of {dominant_ref} — check application logs "
         "and downstream service health."
         if dominant_ref else
         "Investigate the dominant error type — review application logs and "
         "downstream service health."
     )
     b3 = (
-        f"Roll back *{deploy_ref}* or disable the affected checkout path if "
+        f"Roll back {deploy_ref} or disable the affected checkout path if "
         "failures continue."
         if deploy_ref else
         "Roll back or disable the affected checkout path if failures continue."
     )
     actions = (
-        "h2. Recommended Immediate Actions\n\n"
-        f"* {b1}\n"
-        f"* {b2}\n"
-        f"* {b3}\n"
-        "* Monitor checkout 5xx rate in Grafana after each mitigation step.\n"
-        "* Keep this Jira Bug updated with automated follow-up evidence."
+        "\nRecommended Immediate Actions\n\n"
+        f"- {b1}\n"
+        f"- {b2}\n"
+        f"- {b3}\n"
+        "- Monitor checkout 5xx rate in Grafana after each mitigation step.\n"
+        "- Keep this Jira Bug updated with automated follow-up evidence."
     )
     return header + ev_section + geo_section + actions
 
