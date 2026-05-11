@@ -37,7 +37,9 @@ from locust import HttpUser, between, task
 DEMO_IPS: list[str] = [
     # North America
     "8.8.8.8",         # US — Google (AS15169)
+    "8.8.4.4",         # US — Google (AS15169)
     "1.1.1.1",         # US — Cloudflare (AS13335)
+    "1.0.0.1",         # US — Cloudflare (AS13335)
     "9.9.9.9",         # US — Quad9 (AS19281)
     "208.67.222.222",  # US — Cisco OpenDNS (AS36692)
     # Europe
