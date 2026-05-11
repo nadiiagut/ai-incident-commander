@@ -309,31 +309,18 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
     else:
         geo_section = "\nGeographic Impact\n\nIPinfo enrichment not available.\n"
 
-    b1 = (
-        f"Validate whether failures started after deployment {deploy_ref}."
-        if deploy_ref else
-        "Validate whether failures coincide with a recent deployment."
-    )
     b2 = (
-        f"Investigate root cause of {dominant_ref} — check application logs "
-        "and downstream service health."
-        if dominant_ref else
-        "Investigate the dominant error type — review application logs and "
-        "downstream service health."
-    )
-    b3 = (
-        f"Roll back {deploy_ref} or disable the affected checkout path if "
-        "failures continue."
+        f"Compare failure start time with deployment {deploy_ref}."
         if deploy_ref else
-        "Roll back or disable the affected checkout path if failures continue."
+        "Compare failure start time with the most recent deployment."
     )
     actions = (
         "\nRecommended Immediate Actions\n\n"
-        f"- {b1}\n"
+        "- Check payment gateway connectivity and timeout configuration.\n"
         f"- {b2}\n"
-        f"- {b3}\n"
-        "- Monitor checkout 5xx rate in Grafana after each mitigation step.\n"
-        "- Keep this Jira Bug updated with automated follow-up evidence."
+        "- Roll back or disable the affected checkout path if failures continue.\n"
+        "- Monitor checkout 5xx rate in Grafana after mitigation.\n"
+        "- Keep this Bug open until automated follow-up confirms recovery."
     )
     return header + ev_section + geo_section + actions
 
