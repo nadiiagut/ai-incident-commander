@@ -502,6 +502,58 @@ def _build_status_summary(
     return f"Automated monitoring failed for incident {req.jira_issue_key}."
 
 
+def _build_ipinfo_block(
+    enrich_summary: dict | None,
+    section_title: str = "IPinfo Lite impact",
+    include_pattern: bool = True,
+) -> str:
+    """Build a plain-text IPinfo impact section.
+
+    Filters out 'unknown' country/ASN entries when real data exists.
+    Returns a fallback notice when no enriched records are available.
+    """
+    fallback = (
+        f"\n{section_title}:\n"
+        "IPinfo Lite enrichment was unavailable for the sampled failed requests.\n"
+    )
+    if not enrich_summary or not enrich_summary.get("available"):
+        return fallback
+
+    countries: dict = enrich_summary.get("failures_by_country", {})
+    asn_details: list = enrich_summary.get("asn_details", [])
+    known_countries = {c: n for c, n in countries.items() if c.lower() != "unknown"}
+    known_asns = [d for d in asn_details if d.get("asn", "").lower() != "unknown"]
+
+    if not known_countries and not known_asns:
+        return fallback
+
+    lines = [f"\n{section_title}:"]
+
+    if known_countries:
+        lines.append("Affected countries:")
+        for code, count in sorted(known_countries.items(), key=lambda x: x[1], reverse=True)[:5]:
+            word = "failed request" if count == 1 else "failed requests"
+            lines.append(f"- {code}: {count} {word}")
+
+    if known_asns:
+        lines.append("Affected networks:")
+        for d in known_asns[:5]:
+            asn_code = d.get("asn", "")
+            asn_name = d.get("as_name", "")
+            count = d.get("count", 0)
+            word = "failed request" if count == 1 else "failed requests"
+            label = f"{asn_code} \u2014 {asn_name}" if asn_name else asn_code
+            lines.append(f"- {label}: {count} {word}")
+
+    if include_pattern:
+        pattern = enrich_summary.get("impact_pattern", "")
+        if pattern:
+            lines.append("Impact pattern:")
+            lines.append(pattern)
+
+    return "\n".join(lines) + "\n"
+
+
 def _build_jira_comment(
     status: str,
     ev: MonitorEvidence,
@@ -511,8 +563,8 @@ def _build_jira_comment(
     lookback_label: str = "last 5 minutes",
 ) -> str:
     header = (
-        f"AI INCIDENT MONITOR \u2014 {req.jira_issue_key}\n"
-        f"Follow-up check: {req.follow_up_count}/{req.max_followups}\n"
+        f"AI Incident Monitor \u2014 {req.jira_issue_key}\n"
+        f"\nFollow-up check: {req.follow_up_count}/{req.max_followups}\n"
     )
 
     if workflow_action == "stop_monitoring_failed":
@@ -523,81 +575,52 @@ def _build_jira_comment(
             + "Automated monitoring for this incident is ending."
         )
 
-    active_ch_block = (
+    if workflow_action == "stop_recovered":
+        ch_block = (
+            "\nClickHouse monitoring:\n"
+            f"No new {req.endpoint} 5xx responses were found in the {lookback_label}.\n"
+            f"Total failed requests during the incident: {ev.total_failed_requests_since_incident_start}\n"
+            f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
+        )
+        ip_block = _build_ipinfo_block(
+            enrich_summary,
+            section_title="IPinfo Lite impact summary",
+            include_pattern=False,
+        )
+        return (
+            header
+            + "Status: No new 5xx failures observed\n"
+            + ch_block
+            + ip_block
+            + "\nOutcome:\n"
+            + "The checkout service appears recovered. "
+            + "Automated monitoring for this incident is ending.\n"
+            + "No Jira status transition was performed automatically."
+        )
+
+    # Active failure state (continue_monitoring or stop_max_followups)
+    ch_block = (
         "\nCLICKHOUSE MONITORING UPDATE\n"
         f"Failed requests in the {lookback_label}: {ev.failed_requests_last_5m}\n"
         f"Total failed requests since incident start: {ev.total_failed_requests_since_incident_start}\n"
         f"Dominant error: {ev.dominant_error or 'N/A'}\n"
         f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
     )
-
-    active_ip_block = ""
-    if enrich_summary and enrich_summary.get("available"):
-        top_cname = enrich_summary.get("top_country_name") or ev.top_country or "N/A"
-        top_ccnt = enrich_summary.get("top_country_count", 0)
-        top_asn_code = enrich_summary.get("top_affected_asn") or ""
-        top_asn_name = enrich_summary.get("top_asn_name") or ""
-        pattern = enrich_summary.get("impact_pattern") or ""
-        if top_asn_code.lower() in ("", "unknown"):
-            net_label = "N/A"
-        else:
-            net_parts = [p for p in [top_asn_code, top_asn_name] if p]
-            net_label = " \u2014 ".join(net_parts)
-        req_word = "request" if top_ccnt == 1 else "requests"
-        active_ip_block = (
-            "\nIPINFO IMPACT UPDATE\n"
-            f"Top country: {top_cname} \u2014 {top_ccnt} failed {req_word}\n"
-            f"Top network: {net_label}\n"
-            f"Impact pattern: {pattern}\n"
-        )
+    ip_block = _build_ipinfo_block(
+        enrich_summary,
+        section_title="IPinfo Lite impact",
+        include_pattern=True,
+    )
 
     if workflow_action == "stop_max_followups":
         return (
             header
             + "Status: incident remains active\n"
-            + active_ch_block
-            + active_ip_block
-            + "\nOutcome:\n"
-            + "Maximum automated follow-up count reached.\n"
-            + "Manual ownership is required from this point.\n"
-            + "Automated monitoring for this incident is ending."
-        )
-
-    if workflow_action == "stop_recovered":
-        ch_block = (
-            "\nCLICKHOUSE MONITORING UPDATE\n"
-            f"No new {req.endpoint} 5xx responses in the {lookback_label}.\n"
-            f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
-            f"Total failed requests since incident start: {ev.total_failed_requests_since_incident_start}\n"
-        )
-        ip_block = ""
-        if enrich_summary and enrich_summary.get("available"):
-            countries: dict = enrich_summary.get("failures_by_country", {})
-            asn_details: list = enrich_summary.get("asn_details", [])
-            known_countries = {c: n for c, n in countries.items() if c.lower() != "unknown"}
-            display_countries = known_countries if known_countries else countries
-            known_asns = [d for d in asn_details if d.get("asn", "").lower() != "unknown"]
-            display_asns = known_asns if known_asns else asn_details
-            country_str = ", ".join(
-                c for c, _ in sorted(display_countries.items(), key=lambda x: x[1], reverse=True)[:5]
-            ) or "N/A"
-            asn_parts = []
-            for d in display_asns[:3]:
-                asn_code = d.get("asn", "")
-                asn_name = d.get("as_name", "")
-                asn_parts.append(f"{asn_code} \u2014 {asn_name}" if asn_name else asn_code)
-            asn_str = "; ".join(asn_parts) if asn_parts else "N/A"
-            ip_block = (
-                "\nIPINFO IMPACT SUMMARY\n"
-                f"Top countries observed during the incident: {country_str}\n"
-                f"Top networks observed during the incident: {asn_str}\n"
-            )
-        return (
-            header
-            + "Status: no new failures observed\n"
             + ch_block
             + ip_block
             + "\nOutcome:\n"
+            + "Maximum automated follow-up count reached.\n"
+            + "Manual ownership is required from this point.\n"
             + "Automated monitoring for this incident is ending."
         )
 
@@ -605,8 +628,8 @@ def _build_jira_comment(
     return (
         header
         + "Status: incident remains active\n"
-        + active_ch_block
-        + active_ip_block
+        + ch_block
+        + ip_block
         + "\nNext step:\n"
         + "The workflow will continue monitoring until the incident recovers "
         + "or the maximum follow-up count is reached."
@@ -758,11 +781,12 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
 
     enr = enrich_summary or {}
     log.info(
-        "Monitor summary | %s follow_up=%d/%d recent_failed=%d total_failed=%d "
-        "status=%s workflow_action=%s continue=%s "
-        "top_country=%r top_asn=%r enriched_req=%d unknown_req=%d",
-        req.jira_issue_key, req.follow_up_count, req.max_followups,
-        last_5m, total_failed, status, workflow_action, should_continue,
+        "Monitor | %s recent_failed_requests=%d total_failed_since_start=%d "
+        "incident_status=%s workflow_action=%s should_continue=%s "
+        "follow_up=%d/%d top_country=%r top_asn=%r enriched_req=%d unknown_req=%d",
+        req.jira_issue_key, last_5m, total_failed,
+        status, workflow_action, should_continue,
+        req.follow_up_count, req.max_followups,
         top_country, top_asn,
         enr.get("enriched_request_count", 0),
         enr.get("unknown_request_count", 0),
