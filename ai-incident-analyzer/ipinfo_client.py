@@ -91,9 +91,16 @@ def summarize_enrichment(ip_counts: dict[str, int], enrichment: dict[str, dict])
     continent_counts: dict[str, int] = {}
     asn_counts: dict[str, int] = {}
     asn_meta: dict[str, dict] = {}
+    enriched_request_count = 0
+    unknown_request_count = 0
 
     for ip, count in ip_counts.items():
-        info = enrichment.get(ip, {})
+        info = enrichment.get(ip) or {}
+
+        if not info:
+            unknown_request_count += count
+            continue
+        enriched_request_count += count
 
         country_code = info.get("country") or "unknown"
         country_name = info.get("country_name") or country_code
@@ -167,4 +174,6 @@ def summarize_enrichment(ip_counts: dict[str, int], enrichment: dict[str, dict])
         "top_country_count": top_country_count,
         "top_asn_name": top_asn_meta.get("name", ""),
         "top_asn_domain": top_asn_meta.get("domain", ""),
+        "enriched_request_count": enriched_request_count,
+        "unknown_request_count": unknown_request_count,
     }
