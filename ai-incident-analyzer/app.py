@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import clickhouse_client
 import ipinfo_client
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
@@ -731,6 +731,11 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
 
 
 # ── Static pages ──────────────────────────────────────────────────────────────
+
+@app.get("/")
+def root() -> RedirectResponse:
+    return RedirectResponse(url="/architecture-board")
+
 
 @app.get("/architecture-board", response_class=HTMLResponse)
 def architecture_board() -> HTMLResponse:
