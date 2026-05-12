@@ -1,14 +1,18 @@
 import json
 import logging
 import os
+import pathlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import clickhouse_client
 import ipinfo_client
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from openai import OpenAI
 from pydantic import BaseModel, Field
+
+_HERE = pathlib.Path(__file__).parent
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
@@ -724,3 +728,11 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
         jira_comment=_build_jira_comment(status, evidence, req, enrich_summary),
         evidence=evidence,
     )
+
+
+# ── Static pages ──────────────────────────────────────────────────────────────
+
+@app.get("/architecture-board", response_class=HTMLResponse)
+def architecture_board() -> HTMLResponse:
+    """Static architecture diagram page — suitable for video intros and README screenshots."""
+    return HTMLResponse(content=(_HERE / "architecture_board.html").read_text(encoding="utf-8"))

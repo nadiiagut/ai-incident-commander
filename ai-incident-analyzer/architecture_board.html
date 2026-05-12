@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Incident Commander — Architecture</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0b0b12;
+      color: #e2e2f0;
+      font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 56px 48px 64px;
+      line-height: 1.4;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────────────── */
+    h1 {
+      font-size: 2.6rem;
+      font-weight: 800;
+      letter-spacing: -0.025em;
+      color: #f4f4fc;
+      text-align: center;
+      margin-bottom: 16px;
+    }
+
+    .subtitle {
+      font-size: 1.05rem;
+      color: #6a6a8a;
+      text-align: center;
+      max-width: 640px;
+      margin-bottom: 76px;
+      line-height: 1.6;
+    }
+
+    /* ── Flow row ────────────────────────────────────────────────────────────── */
+    .flow {
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      width: 100%;
+      max-width: 1440px;
+    }
+
+    /* ── Station: main node + support items ─────────────────────────────────── */
+    .station {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+    }
+
+    /* ── Main node box ───────────────────────────────────────────────────────── */
+    .node {
+      border: 2px solid;
+      border-radius: 12px;
+      background: #13131f;
+      padding: 22px 20px;
+      text-align: center;
+      width: 100%;
+      min-height: 80px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+    }
+
+    .node-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+
+    .node-sub {
+      font-size: 0.78rem;
+      color: #5a5a7a;
+    }
+
+    .node-blue   { border-color: #3b82f6; }
+    .node-blue   .node-title { color: #60a5fa; }
+
+    .node-orange { border-color: #f97316; }
+    .node-orange .node-title { color: #fb923c; }
+
+    .node-green  { border-color: #22c55e; }
+    .node-green  .node-title { color: #4ade80; }
+
+    /* ── n8n Flow frame ──────────────────────────────────────────────────────── */
+    .n8n-frame {
+      border: 2px solid #7c3aed;
+      border-radius: 14px;
+      background: rgba(109, 40, 217, 0.06);
+      padding: 18px 20px 20px;
+      width: 100%;
+    }
+
+    .frame-title {
+      font-size: 0.72rem;
+      font-weight: 800;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: #a78bfa;
+      text-align: center;
+      margin-bottom: 16px;
+      padding-bottom: 11px;
+      border-bottom: 1px solid rgba(124, 58, 237, 0.22);
+    }
+
+    .frame-inner {
+      display: flex;
+      gap: 14px;
+    }
+
+    .sub-node {
+      flex: 1;
+      background: #181828;
+      border: 1px solid rgba(139, 92, 246, 0.32);
+      border-radius: 10px;
+      padding: 18px 16px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+    }
+
+    .sub-title {
+      font-size: 1rem;
+      font-weight: 700;
+      color: #c4b5fd;
+    }
+
+    .sub-desc {
+      font-size: 0.78rem;
+      color: #5a5a7a;
+      line-height: 1.5;
+    }
+
+    /* ── Support items ───────────────────────────────────────────────────────── */
+    .supports {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      width: 100%;
+    }
+
+    .support {
+      background: #0f0f1c;
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 8px;
+      padding: 9px 14px;
+      text-align: center;
+    }
+
+    .sup-name {
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+
+    .sup-desc {
+      font-size: 0.72rem;
+      color: #444460;
+      margin-top: 3px;
+    }
+
+    .s-blue   { border-color: rgba(59,130,246,0.28); }
+    .s-blue   .sup-name { color: #7ab3f8; }
+
+    .s-orange { border-color: rgba(249,115,22,0.28); }
+    .s-orange .sup-name { color: #fba570; }
+
+    .s-purple { border-color: rgba(124,58,237,0.28); }
+    .s-purple .sup-name { color: #c4a8fc; }
+
+    .s-teal   { border-color: rgba(20,184,166,0.28); }
+    .s-teal   .sup-name { color: #5eead4; }
+
+    /* ── Arrow connector ─────────────────────────────────────────────────────── */
+    .arrow {
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      /* nudge arrow to center with 80px min-height node: (80/2 - 10) = 30px */
+      padding-top: 30px;
+      flex-shrink: 0;
+      width: 64px;
+    }
+
+    .arrow svg {
+      width: 54px;
+      height: 20px;
+      overflow: visible;
+    }
+
+    /* ── Footer ──────────────────────────────────────────────────────────────── */
+    footer {
+      margin-top: 76px;
+      font-size: 0.82rem;
+      color: #3e3e58;
+      text-align: center;
+      letter-spacing: 0.06em;
+    }
+
+    footer em {
+      color: #5a5a7a;
+      font-style: normal;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>AI Incident Commander</h1>
+  <p class="subtitle">Automated incident detection, evidence collection, Jira creation, and follow-up monitoring</p>
+
+  <div class="flow">
+
+    <!-- 1 ── Locust Traffic ─────────────────────────────────────────────────── -->
+    <div class="station" style="min-width:158px;max-width:178px;">
+      <div class="node node-blue">
+        <div class="node-title">Locust Traffic</div>
+        <div class="node-sub">synthetic HTTP load</div>
+      </div>
+      <div class="supports">
+        <div class="support s-blue">
+          <div class="sup-name">checkout-api</div>
+          <div class="sup-desc">FastAPI service</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Arrow ── -->
+    <div class="arrow">
+      <svg viewBox="0 0 54 20" fill="none">
+        <line x1="2" y1="10" x2="42" y2="10" stroke="#32325a" stroke-width="2"/>
+        <polygon points="38,5 52,10 38,15" fill="#32325a"/>
+      </svg>
+    </div>
+
+    <!-- 2 ── Grafana Alert ───────────────────────────────────────────────────── -->
+    <div class="station" style="min-width:158px;max-width:178px;">
+      <div class="node node-orange">
+        <div class="node-title">Grafana Alert</div>
+        <div class="node-sub">5xx rate threshold</div>
+      </div>
+      <div class="supports">
+        <div class="support s-orange">
+          <div class="sup-name">Prometheus</div>
+          <div class="sup-desc">metrics</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Arrow ── -->
+    <div class="arrow">
+      <svg viewBox="0 0 54 20" fill="none">
+        <line x1="2" y1="10" x2="42" y2="10" stroke="#32325a" stroke-width="2"/>
+        <polygon points="38,5 52,10 38,15" fill="#32325a"/>
+      </svg>
+    </div>
+
+    <!-- 3 ── AI Incident Analyzer ────────────────────────────────────────────── -->
+    <div class="station" style="min-width:185px;max-width:210px;">
+      <div class="node node-blue">
+        <div class="node-title">AI Incident Analyzer</div>
+        <div class="node-sub">evidence &amp; analysis</div>
+      </div>
+      <div class="supports">
+        <div class="support s-teal">
+          <div class="sup-name">OpenAI API</div>
+          <div class="sup-desc">LLM analysis</div>
+        </div>
+        <div class="support s-blue">
+          <div class="sup-name">ClickHouse</div>
+          <div class="sup-desc">log evidence</div>
+        </div>
+        <div class="support s-purple">
+          <div class="sup-name">IPinfo Lite</div>
+          <div class="sup-desc">impact enrichment</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Arrow ── -->
+    <div class="arrow">
+      <svg viewBox="0 0 54 20" fill="none">
+        <line x1="2" y1="10" x2="42" y2="10" stroke="#32325a" stroke-width="2"/>
+        <polygon points="38,5 52,10 38,15" fill="#32325a"/>
+      </svg>
+    </div>
+
+    <!-- 4 ── n8n Flow ────────────────────────────────────────────────────────── -->
+    <div class="station" style="min-width:390px;max-width:450px;">
+      <div class="n8n-frame">
+        <div class="frame-title">n8n Flow</div>
+        <div class="frame-inner">
+          <div class="sub-node">
+            <div class="sub-title">Jira Incident</div>
+            <div class="sub-desc">Creates Jira Bug with incident details</div>
+          </div>
+          <div class="sub-node">
+            <div class="sub-title">Follow-up Monitoring</div>
+            <div class="sub-desc">Adds comments until recovery or max follow-ups</div>
+          </div>
+        </div>
+      </div>
+      <div class="supports">
+        <div class="support s-purple">
+          <div class="sup-name">Jira Cloud</div>
+          <div class="sup-desc">issue tracking</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Arrow ── -->
+    <div class="arrow">
+      <svg viewBox="0 0 54 20" fill="none">
+        <line x1="2" y1="10" x2="42" y2="10" stroke="#32325a" stroke-width="2"/>
+        <polygon points="38,5 52,10 38,15" fill="#32325a"/>
+      </svg>
+    </div>
+
+    <!-- 5 ── Recovery / Resolution ────────────────────────────────────────────── -->
+    <div class="station" style="min-width:168px;max-width:192px;">
+      <div class="node node-green">
+        <div class="node-title">Recovery / Resolution</div>
+        <div class="node-sub">incident mitigated</div>
+      </div>
+    </div>
+
+  </div>
+
+  <footer>
+    Stack: <em>Locust &nbsp;·&nbsp; FastAPI &nbsp;·&nbsp; Prometheus &nbsp;·&nbsp; Grafana &nbsp;·&nbsp; ClickHouse &nbsp;·&nbsp; IPinfo Lite &nbsp;·&nbsp; OpenAI &nbsp;·&nbsp; n8n &nbsp;·&nbsp; Jira</em>
+  </footer>
+
+</body>
+</html>
