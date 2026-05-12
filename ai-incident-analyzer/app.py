@@ -245,25 +245,29 @@ def _format_asn_line(d: dict) -> str:
 
 def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -> str:
     """
-    Build plain-text Jira description using real evidence when available,
-    degrading gracefully when ClickHouse or IPinfo data is absent.
-    No wiki markup, no heading markers, no bold/italic tokens.
+    Build plain-text Jira description using real evidence when available.
+    Uppercase section titles, no wiki/markdown markers.
     """
     has_live = evidence.get("source") == "clickhouse" and not evidence.get("no_data")
     deploy_ref = (
         ", ".join(evidence.get("deployment_versions", [])) or None
     ) if has_live else None
-    dominant_ref = (evidence.get("dominant_error") or None) if has_live else None
 
+    # ── INCIDENT SUMMARY ──────────────────────────────────────────────────────
+    summary_line = (
+        f"Elevated {alert.severity} errors detected on {alert.service} "
+        f"via Grafana alert."
+    )
     header = (
-        "Incident Summary\n\n"
+        "INCIDENT SUMMARY\n\n"
+        f"{summary_line}\n\n"
         f"Alert: {alert.alert_name}\n"
         f"Service: {alert.service}\n"
         f"Severity: {alert.severity}\n"
-        f"Started: {started}\n"
-        f"Dashboard: {alert.dashboard_url or 'N/A'}\n"
+        "Status: Active\n"
     )
 
+    # ── CLICKHOUSE LOG EVIDENCE ───────────────────────────────────────────────
     if has_live:
         count = evidence.get("failed_request_count", 0)
         first = evidence.get("first_seen") or "N/A"
@@ -271,19 +275,14 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
         dominant = evidence.get("dominant_error") or "N/A"
         versions = ", ".join(evidence.get("deployment_versions", [])) or "N/A"
 
-        ip_counts: dict = evidence.get("ip_counts", {})
-        top_ips = sorted(ip_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        ip_lines = "\n".join(f"- {ip} ({cnt} req)" for ip, cnt in top_ips) or "- N/A"
-
         ev_section = (
-            "\nLog Evidence\n\n"
-            "Source: ClickHouse (live)\n"
-            f"Failed Requests: {count}\n"
-            f"First Seen: {first}\n"
-            f"Latest Seen: {latest}\n"
-            f"Dominant Error: {dominant}\n"
-            f"Deployment: {versions}\n\n"
-            f"Top Client IPs:\n{ip_lines}\n"
+            "\nCLICKHOUSE LOG EVIDENCE\n\n"
+            "Query window: since incident start\n"
+            f"Failed checkout requests found: {count}\n"
+            f"First failure seen: {first}\n"
+            f"Latest failure seen: {latest}\n"
+            f"Dominant error: {dominant}\n"
+            f"Deployment version: {versions}\n"
         )
 
         sample: list[dict] = evidence.get("recent_sample", [])
@@ -295,14 +294,19 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
                 sc = row.get("status_code", "N/A")
                 err = str(row.get("error") or "N/A")[:60]
                 lat = row.get("response_time_ms", "N/A")
-                bullets += f"- {ts} | ip={ip} | status={sc} | error={err} | latency={lat}ms\n"
-            ev_section += f"\nRecent Failed Requests:\n{bullets}"
+                bullets += f"- {ts} | ip={ip} | {sc} | {err} | latency={lat}ms\n"
+            recent_section = f"\nRECENT FAILED REQUESTS FROM CLICKHOUSE\n\n{bullets}"
+        else:
+            recent_section = ""
     else:
         ev_section = (
-            "\nLog Evidence\n\n"
-            "Live ClickHouse evidence not available. See Grafana dashboard for current metrics.\n"
+            "\nCLICKHOUSE LOG EVIDENCE\n\n"
+            "Live ClickHouse evidence not available. "
+            "See Grafana dashboard for current metrics.\n"
         )
+        recent_section = ""
 
+    # ── IPINFO LITE IMPACT ENRICHMENT ─────────────────────────────────────────
     enrichment: dict = evidence.get("enrichment", {})
     if enrichment.get("available") is not False and enrichment:
         countries: dict = enrichment.get("failures_by_country", {})
@@ -322,36 +326,41 @@ def _build_jira_description(alert: AlertPayload, evidence: dict, started: str) -
                 for a, n in sorted(asns.items(), key=lambda x: x[1], reverse=True)[:5]
             ) or "- N/A"
 
-        impact_pattern = enrichment.get("impact_pattern", "")
+        interpretation = enrichment.get("impact_pattern", "")
 
         geo_section = (
-            "\nImpact Analysis by IPinfo Lite\n\n"
+            "\nIPINFO LITE IMPACT ENRICHMENT\n\n"
             f"Affected countries:\n{country_lines}\n\n"
             f"Affected networks / ASNs:\n{asn_lines}\n\n"
-            f"Impact pattern:\n{impact_pattern}\n"
+            f"Impact interpretation:\n{interpretation}\n"
         )
     elif has_live:
         geo_section = (
-            "\nImpact Analysis by IPinfo Lite\n\n"
-            "IPinfo enrichment unavailable. Raw client IP evidence is included above.\n"
+            "\nIPINFO LITE IMPACT ENRICHMENT\n\n"
+            "IPinfo enrichment was unavailable; raw client IP evidence "
+            "remains available in the ClickHouse log section.\n"
         )
     else:
-        geo_section = "\nImpact Analysis by IPinfo Lite\n\nIPinfo enrichment not available.\n"
+        geo_section = (
+            "\nIPINFO LITE IMPACT ENRICHMENT\n\n"
+            "IPinfo enrichment not available.\n"
+        )
 
+    # ── RECOMMENDED IMMEDIATE ACTIONS ─────────────────────────────────────────
     b2 = (
         f"Compare failure start time with deployment {deploy_ref}."
         if deploy_ref else
         "Compare failure start time with the most recent deployment."
     )
     actions = (
-        "\nRecommended Immediate Actions\n\n"
+        "\nRECOMMENDED IMMEDIATE ACTIONS\n\n"
         "- Check payment gateway connectivity and timeout configuration.\n"
         f"- {b2}\n"
         "- Roll back or disable the affected checkout path if failures continue.\n"
         "- Monitor checkout 5xx rate in Grafana after mitigation.\n"
-        "- Keep this Bug open until automated follow-up confirms recovery."
+        "- Keep this Jira Bug open until automated follow-up confirms recovery."
     )
-    return header + ev_section + geo_section + actions
+    return header + ev_section + recent_section + geo_section + actions
 
 
 # ── Safe fallback ────────────────────────────────────────────────────────────────
@@ -476,63 +485,87 @@ def _build_jira_comment(
     enrich_summary: dict | None = None,
 ) -> str:
     header = (
-        f"AI Incident Monitor \u2014 {req.jira_issue_key}\n\n"
+        f"AI INCIDENT MONITOR \u2014 {req.jira_issue_key}\n"
         f"Follow-up check: {req.follow_up_count}/{req.max_followups}\n"
     )
 
-    ipinfo_block = ""
-    if enrich_summary and enrich_summary.get("available"):
-        top_cname = enrich_summary.get("top_country_name") or ev.top_country or "N/A"
-        top_ccnt = enrich_summary.get("top_country_count", 0)
-        top_asn = enrich_summary.get("top_affected_asn") or "N/A"
-        top_asn_name = enrich_summary.get("top_asn_name") or ""
-        top_asn_domain = enrich_summary.get("top_asn_domain") or ""
-        pattern = enrich_summary.get("impact_pattern") or ""
-        net_parts = [p for p in [top_asn, top_asn_name, top_asn_domain] if p]
-        net_label = " \u2014 ".join(net_parts)
-        req_word = "request" if top_ccnt == 1 else "requests"
-        ipinfo_block = (
-            "\nIPinfo impact:\n"
-            f"Top country: {top_cname} \u2014 {top_ccnt} failed {req_word}\n"
-            f"Top network: {net_label}\n"
-            f"Impact pattern: {pattern}\n"
+    if status == "still_failing":
+        ch_block = (
+            "\nCLICKHOUSE MONITORING UPDATE\n"
+            f"Failed requests in the last 5 minutes: {ev.failed_requests_last_5m}\n"
+            f"Total failed requests since incident start: {ev.total_failed_requests_since_incident_start}\n"
+            f"Dominant error: {ev.dominant_error or 'N/A'}\n"
+            f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
         )
 
-    if status == "still_failing":
-        geo = ""
-        if not ipinfo_block and (ev.top_country or ev.top_asn):
-            geo = (
-                f"Top affected country: {ev.top_country or 'N/A'}\n"
-                f"Top affected ASN: {ev.top_asn or 'N/A'}\n"
+        ip_block = ""
+        if enrich_summary and enrich_summary.get("available"):
+            top_cname = enrich_summary.get("top_country_name") or ev.top_country or "N/A"
+            top_ccnt = enrich_summary.get("top_country_count", 0)
+            top_asn = enrich_summary.get("top_affected_asn") or "N/A"
+            top_asn_name = enrich_summary.get("top_asn_name") or ""
+            pattern = enrich_summary.get("impact_pattern") or ""
+            net_parts = [p for p in [top_asn, top_asn_name] if p]
+            net_label = " \u2014 ".join(net_parts)
+            req_word = "request" if top_ccnt == 1 else "requests"
+            ip_block = (
+                "\nIPINFO IMPACT UPDATE\n"
+                f"Top country: {top_cname} \u2014 {top_ccnt} failed {req_word}\n"
+                f"Top network: {net_label}\n"
+                f"Impact pattern: {pattern}\n"
             )
+
         return (
             header
-            + "Status: Incident remains active\n\n"
-            + f"Failed requests in the last 5 minutes: {ev.failed_requests_last_5m}\n"
-            + f"Total since incident start: {ev.total_failed_requests_since_incident_start}\n"
-            + f"Dominant error: {ev.dominant_error or 'N/A'}\n"
-            + f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
-            + geo
-            + ipinfo_block
-            + "\nThe workflow will continue monitoring unless the incident recovers "
+            + "Status: incident remains active\n"
+            + ch_block
+            + ip_block
+            + "\nNext step:\n"
+            + "The workflow will continue monitoring unless the incident recovers "
             + "or the maximum follow-up count is reached."
         )
 
     if status == "recovered":
+        ch_block = (
+            "\nCLICKHOUSE MONITORING UPDATE\n"
+            f"No new {req.endpoint} 5xx responses were found in the last 5 minutes.\n"
+            f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
+            f"Total failed requests since incident start: {ev.total_failed_requests_since_incident_start}\n"
+        )
+
+        ip_block = ""
+        if enrich_summary and enrich_summary.get("available"):
+            countries: dict = enrich_summary.get("failures_by_country", {})
+            country_names: dict = enrich_summary.get("country_names", {})
+            c_lines = "\n".join(
+                f"- {country_names.get(c, c)}: {n} failed request{'s' if n != 1 else ''}"
+                for c, n in sorted(countries.items(), key=lambda x: x[1], reverse=True)[:5]
+            ) or "- N/A"
+            asn_details: list = enrich_summary.get("asn_details", [])
+            a_lines = "\n".join(_format_asn_line(d) for d in asn_details[:5]) or "- N/A"
+            ip_block = (
+                "\nIPINFO IMPACT SUMMARY\n"
+                "Previous failures affected:\n"
+                + c_lines + "\n"
+                + a_lines + "\n"
+            )
+
         return (
             header
-            + "Status: No new failures observed\n\n"
-            + f"No new {req.endpoint} 5xx responses were observed in the last 5 minutes.\n\n"
-            + f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
-            + f"Total since incident start: {ev.total_failed_requests_since_incident_start}\n"
-            + ipinfo_block
-            + "\nThe incident appears mitigated. Automated monitoring for this incident is ending.\n\n"
-            + "No automated Jira transition was performed. Verify manually before closing."
+            + "Status: no new failures observed\n"
+            + ch_block
+            + ip_block
+            + "\nOutcome:\n"
+            + "The incident appears mitigated. "
+            + "Automated monitoring for this incident is ending.\n"
+            + "No automated Jira transition was performed; "
+            + "verify manually before closing."
         )
 
     return (
         header
-        + "Automated follow-up could not retrieve ClickHouse evidence.\n\n"
+        + "Status: monitoring failed\n\n"
+        + "Automated follow-up could not retrieve ClickHouse evidence.\n"
         + "Manual verification of current service health is recommended."
     )
 

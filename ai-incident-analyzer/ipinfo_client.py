@@ -122,14 +122,14 @@ def summarize_enrichment(ip_counts: dict[str, int], enrichment: dict[str, dict])
 
     if unique_asns > 1 and unique_countries > 1:
         impact_pattern = (
-            "Failures span multiple countries and networks. "
-            "Impact appears broader than a single-client or single-network issue."
+            "Failures span multiple networks and countries, which suggests a broader "
+            "service-side incident rather than a single-client or single-network problem."
         )
     elif unique_asns == 1 and top_asn != "unknown":
         org_name = top_asn_meta.get("name") or top_asn
         impact_pattern = (
-            f"Impact appears concentrated in {org_name}. "
-            "Check for customer or network-specific scope."
+            f"Impact appears concentrated in {org_name}, "
+            "which may indicate a customer or network-specific issue."
         )
     else:
         impact_pattern = (
