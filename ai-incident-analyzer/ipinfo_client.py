@@ -120,12 +120,17 @@ def summarize_enrichment(ip_counts: dict[str, int], enrichment: dict[str, dict])
 
     unique_countries = len(country_counts)
     unique_asns = len(asn_counts)
-    top_asn = top_asns[0][0] if top_asns else "unknown"
+
+    # Prefer non-unknown entries when real enriched data exists
+    _known_asns = [(a, n) for a, n in top_asns if a.lower() != "unknown"]
+    top_asn = _known_asns[0][0] if _known_asns else (top_asns[0][0] if top_asns else "unknown")
     top_asn_meta = asn_meta.get(top_asn, {})
 
-    top_country_code = top_countries[0][0] if top_countries else "unknown"
+    _known_countries = [(c, n) for c, n in top_countries if c.lower() != "unknown"]
+    _top_c = _known_countries[0] if _known_countries else (top_countries[0] if top_countries else ("unknown", 0))
+    top_country_code = _top_c[0]
     top_country_name = country_names.get(top_country_code, top_country_code)
-    top_country_count = top_countries[0][1] if top_countries else 0
+    top_country_count = _top_c[1]
 
     if unique_asns > 1 and unique_countries > 1:
         impact_pattern = (

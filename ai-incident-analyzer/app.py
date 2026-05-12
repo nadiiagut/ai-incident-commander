@@ -23,6 +23,7 @@ CLICKHOUSE_TABLE: str = os.getenv("CLICKHOUSE_TABLE", "checkout_logs")
 CLICKHOUSE_USERNAME: str = os.getenv("CLICKHOUSE_USERNAME", "")
 CLICKHOUSE_PASSWORD: str = os.getenv("CLICKHOUSE_PASSWORD", "")
 IPINFO_TOKEN: str = os.getenv("IPINFO_TOKEN", "")
+MONITOR_LOOKBACK_SECONDS: int = int(os.getenv("MONITOR_LOOKBACK_SECONDS", "300"))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ai-incident-analyzer")
@@ -36,8 +37,8 @@ async def _lifespan(app: FastAPI):
         CLICKHOUSE_USERNAME, bool(CLICKHOUSE_PASSWORD),
     )
     log.info(
-        "Config | OPENAI_MODEL=%r  openai_key_set=%s  ipinfo_token_set=%s",
-        OPENAI_MODEL, bool(OPENAI_API_KEY), bool(IPINFO_TOKEN),
+        "Config | OPENAI_MODEL=%r  openai_key_set=%s  ipinfo_token_set=%s  monitor_lookback_s=%d",
+        OPENAI_MODEL, bool(OPENAI_API_KEY), bool(IPINFO_TOKEN), MONITOR_LOOKBACK_SECONDS,
     )
     yield
 
@@ -458,6 +459,17 @@ def _call_openai(alert: AlertPayload, evidence: dict) -> IncidentAnalysis:
 
 # ── Monitor helpers ────────────────────────────────────────────────────────────
 
+def _format_lookback_label(seconds: int) -> str:
+    """Return a human-readable duration: 'last 30 seconds', 'last 2 minutes', 'last 1 hour'."""
+    if seconds < 60:
+        return f"last {seconds} second{'s' if seconds != 1 else ''}"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"last {minutes} minute{'s' if minutes != 1 else ''}"
+    hours = minutes // 60
+    return f"last {hours} hour{'s' if hours != 1 else ''}"
+
+
 def _parse_ts(ts: str) -> str:
     """Normalise any ISO 8601-ish timestamp to 'YYYY-MM-DD HH:MM:SS.mmm' UTC."""
     normalised = ts.strip().replace("T", " ")
@@ -471,20 +483,21 @@ def _parse_ts(ts: str) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
 
 
-def _build_status_summary(status: str, ev: MonitorEvidence, req: MonitorRequest) -> str:
+def _build_status_summary(
+    status: str, ev: MonitorEvidence, req: MonitorRequest, lookback_label: str = "last 5 minutes"
+) -> str:
     if status == "still_failing":
         return (
             f"Incident {req.jira_issue_key} is still active: "
-            f"{ev.failed_requests_last_5m} failures in the last 5 minutes "
+            f"{ev.failed_requests_last_5m} failures in the {lookback_label} "
             f"({ev.total_failed_requests_since_incident_start} total since incident start). "
             f"Dominant error: {ev.dominant_error or 'N/A'}."
         )
     if status == "recovered":
         return (
             f"Incident {req.jira_issue_key} appears recovered: "
-            "no /checkout 5xx responses in the last 5 minutes. "
-            f"Total failures since incident start: {ev.total_failed_requests_since_incident_start}. "
-            "Continue monitoring before closing."
+            f"no {req.endpoint} 5xx responses in the {lookback_label}. "
+            f"Total failures since incident start: {ev.total_failed_requests_since_incident_start}."
         )
     return f"Automated monitoring failed for incident {req.jira_issue_key}."
 
@@ -495,6 +508,7 @@ def _build_jira_comment(
     req: MonitorRequest,
     enrich_summary: dict | None = None,
     workflow_action: str = "continue_monitoring",
+    lookback_label: str = "last 5 minutes",
 ) -> str:
     header = (
         f"AI INCIDENT MONITOR \u2014 {req.jira_issue_key}\n"
@@ -511,7 +525,7 @@ def _build_jira_comment(
 
     active_ch_block = (
         "\nCLICKHOUSE MONITORING UPDATE\n"
-        f"Failed requests in the last 5 minutes: {ev.failed_requests_last_5m}\n"
+        f"Failed requests in the {lookback_label}: {ev.failed_requests_last_5m}\n"
         f"Total failed requests since incident start: {ev.total_failed_requests_since_incident_start}\n"
         f"Dominant error: {ev.dominant_error or 'N/A'}\n"
         f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
@@ -521,11 +535,14 @@ def _build_jira_comment(
     if enrich_summary and enrich_summary.get("available"):
         top_cname = enrich_summary.get("top_country_name") or ev.top_country or "N/A"
         top_ccnt = enrich_summary.get("top_country_count", 0)
-        top_asn_code = enrich_summary.get("top_affected_asn") or "N/A"
+        top_asn_code = enrich_summary.get("top_affected_asn") or ""
         top_asn_name = enrich_summary.get("top_asn_name") or ""
         pattern = enrich_summary.get("impact_pattern") or ""
-        net_parts = [p for p in [top_asn_code, top_asn_name] if p]
-        net_label = " \u2014 ".join(net_parts)
+        if top_asn_code.lower() in ("", "unknown"):
+            net_label = "N/A"
+        else:
+            net_parts = [p for p in [top_asn_code, top_asn_name] if p]
+            net_label = " \u2014 ".join(net_parts)
         req_word = "request" if top_ccnt == 1 else "requests"
         active_ip_block = (
             "\nIPINFO IMPACT UPDATE\n"
@@ -549,25 +566,31 @@ def _build_jira_comment(
     if workflow_action == "stop_recovered":
         ch_block = (
             "\nCLICKHOUSE MONITORING UPDATE\n"
-            f"No new {req.endpoint} 5xx responses in the last 5 minutes.\n"
+            f"No new {req.endpoint} 5xx responses in the {lookback_label}.\n"
             f"Latest failed request: {ev.latest_failed_request or 'N/A'}\n"
             f"Total failed requests since incident start: {ev.total_failed_requests_since_incident_start}\n"
         )
         ip_block = ""
         if enrich_summary and enrich_summary.get("available"):
             countries: dict = enrich_summary.get("failures_by_country", {})
-            country_names_map: dict = enrich_summary.get("country_names", {})
-            c_lines = "\n".join(
-                f"- {country_names_map.get(c, c)}: {n} failed request{'s' if n != 1 else ''}"
-                for c, n in sorted(countries.items(), key=lambda x: x[1], reverse=True)[:5]
-            ) or "- N/A"
             asn_details: list = enrich_summary.get("asn_details", [])
-            a_lines = "\n".join(_format_asn_line(d) for d in asn_details[:5]) or "- N/A"
+            known_countries = {c: n for c, n in countries.items() if c.lower() != "unknown"}
+            display_countries = known_countries if known_countries else countries
+            known_asns = [d for d in asn_details if d.get("asn", "").lower() != "unknown"]
+            display_asns = known_asns if known_asns else asn_details
+            country_str = ", ".join(
+                c for c, _ in sorted(display_countries.items(), key=lambda x: x[1], reverse=True)[:5]
+            ) or "N/A"
+            asn_parts = []
+            for d in display_asns[:3]:
+                asn_code = d.get("asn", "")
+                asn_name = d.get("as_name", "")
+                asn_parts.append(f"{asn_code} \u2014 {asn_name}" if asn_name else asn_code)
+            asn_str = "; ".join(asn_parts) if asn_parts else "N/A"
             ip_block = (
                 "\nIPINFO IMPACT SUMMARY\n"
-                "Previous failures affected:\n"
-                + c_lines + "\n"
-                + a_lines + "\n"
+                f"Top countries observed during the incident: {country_str}\n"
+                f"Top networks observed during the incident: {asn_str}\n"
             )
         return (
             header
@@ -694,9 +717,11 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
     if full_ev is None:
         return _monitor_failed(req, "ClickHouse query failed (full window)")
 
+    lookback_label = _format_lookback_label(MONITOR_LOOKBACK_SECONDS)
+    recent_expr = f"now() - INTERVAL {MONITOR_LOOKBACK_SECONDS} SECOND"
     recent_ev = clickhouse_client.fetch_since(
         CLICKHOUSE_URL, CLICKHOUSE_DATABASE, CLICKHOUSE_TABLE,
-        req.endpoint, "now() - INTERVAL 5 MINUTE",
+        req.endpoint, recent_expr,
         CLICKHOUSE_USERNAME, CLICKHOUSE_PASSWORD,
     )
     if recent_ev is None:
@@ -760,8 +785,8 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
     return MonitorResponse(
         jira_issue_key=req.jira_issue_key,
         incident_status=status,
-        status_summary=_build_status_summary(status, evidence, req),
-        jira_comment=_build_jira_comment(status, evidence, req, enrich_summary, workflow_action),
+        status_summary=_build_status_summary(status, evidence, req, lookback_label),
+        jira_comment=_build_jira_comment(status, evidence, req, enrich_summary, workflow_action, lookback_label),
         evidence=evidence,
         workflow_action=workflow_action,
         should_continue_monitoring=should_continue,
