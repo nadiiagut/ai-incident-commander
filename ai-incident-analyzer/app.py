@@ -536,12 +536,47 @@ def _build_war_room_message(req: WarRoomRequest, evidence: dict) -> str:
         '  "engineering_evidence": ["observation 1 from logs", "observation 2"],\n'
         '  "regression_suspicion": "Evidence of a recent change causing this",\n'
         '  "recommended_actions": ["step 1", "step 2"],\n'
-        '  "owner_action_items": [{"owner": "on-call SRE", "action": "...", "priority": "high"}],\n'
+        '  "owner_action_items": [\n'
+        '    {"owner": "Engineering", "action": "...", "priority": "high"},\n'
+        '    {"owner": "QA", "action": "...", "priority": "medium"},\n'
+        '    {"owner": "SRE/Platform", "action": "...", "priority": "high"},\n'
+        '    {"owner": "Product/Customer Success", "action": "...", "priority": "medium"}\n'
+        '  ],\n'
         '  "stakeholder_update": "Ready-to-send 2-3 sentence Slack/email update",\n'
         '  "next_update_recommendation": "In 15 minutes or on status change",\n'
-        '  "jira_comment": "Plain-text Jira comment summarising war room status and next actions"\n'
+        '  "jira_comment": "Leave as empty string — will be generated from other fields"\n'
         "}\n\n"
         "Return ONLY the JSON object. No markdown fences, no extra text."
+    )
+
+
+def _format_war_room_jira_comment(
+    incident_status: str,
+    executive_summary: str,
+    customer_impact: str,
+    probable_root_cause: str,
+    confidence_percent: int,
+    engineering_evidence: list[str],
+    recommended_actions: list[str],
+    owner_action_items: list[OwnerActionItem],
+    stakeholder_update: str,
+    next_update_recommendation: str,
+) -> str:
+    ev_lines = "\n".join(f"- {e}" for e in engineering_evidence)
+    action_lines = "\n".join(f"{i + 1}. {a}" for i, a in enumerate(recommended_actions))
+    owner_lines = "\n".join(f"- {item.owner}: {item.action}" for item in owner_action_items)
+    return (
+        "AI War Room Assistant \u2014 Incident Brief\n\n"
+        f"Status:\n{incident_status}\n\n"
+        f"Executive summary:\n{executive_summary}\n\n"
+        f"Customer impact:\n{customer_impact}\n\n"
+        f"Probable root cause:\n{probable_root_cause}\n\n"
+        f"Confidence:\n{confidence_percent}%\n\n"
+        f"Evidence:\n{ev_lines}\n\n"
+        f"Recommended actions:\n{action_lines}\n\n"
+        f"Owner action items:\n{owner_lines}\n\n"
+        f"Stakeholder update:\n{stakeholder_update}\n\n"
+        f"Next update:\n{next_update_recommendation}"
     )
 
 
@@ -578,31 +613,49 @@ def _war_room_fallback(req: WarRoomRequest, evidence: dict | None = None) -> War
     enrichment = ev.get("enrichment", {})
     top_country = enrichment.get("top_country_name", "")
     geo_note = f" Highest impact from {top_country}." if top_country else ""
-    ev_lines = "\n".join(f"- {e}" for e in eng_evidence)
-    action_lines = "\n".join([
-        f"- Check {req.service} pod health and recent rollout status",
-        "- Verify payment gateway connectivity and latency",
-        "- Review deployment changelog for changes to the checkout path",
-    ])
-    jira_comment = (
-        f"*[AI War Room Assistant — War Room Session]*\n\n"
-        f"*Status:* Active | *Confidence:* {confidence}%\n"
-        f"*Service:* {req.service} | *Severity:* {req.severity}\n\n"
-        f"*Engineering Evidence:*\n{ev_lines}\n\n"
-        f"*Next Actions:*\n{action_lines}"
+
+    incident_status = "active"
+    executive_summary = (
+        f"Service '{req.service}' is experiencing elevated checkout errors "
+        f"(severity: {req.severity}, alert: {req.alert_name}). "
+        "Engineering is actively investigating and preparing mitigation options."
     )
+    customer_impact = (
+        "Customers attempting to complete purchases are receiving errors. "
+        "Checkout success rate is degraded. Revenue impact is ongoing until resolved."
+    )
+    recommended_actions = [
+        f"Verify {req.service} pod health and recent deployment history",
+        "Check payment gateway connectivity and timeout configuration",
+        "Review deployment changelog for changes to the checkout path",
+        "Prepare rollback to the last known-good deployment version",
+        "Monitor error rate in Grafana after any mitigation action",
+    ]
+    owner_action_items = [
+        OwnerActionItem(owner="Engineering",
+                        action=f"Check pod logs and rollout status for {req.service}; prepare rollback",
+                        priority="high"),
+        OwnerActionItem(owner="QA",
+                        action="Validate checkout flow in staging after any fix is applied",
+                        priority="medium"),
+        OwnerActionItem(owner="SRE/Platform",
+                        action="Monitor error rate, verify rollout status, check payment gateway health",
+                        priority="high"),
+        OwnerActionItem(owner="Product/Customer Success",
+                        action="Post status page update and notify affected customers proactively",
+                        priority="medium"),
+    ]
+    stakeholder_update = (
+        f"[War Room Update] Service '{req.service}' is experiencing checkout errors "
+        f"(severity: {req.severity}).{geo_note} "
+        "Engineering is investigating. Next update in 15 minutes."
+    )
+    next_update = "Post next update in 15 minutes or immediately on any status change."
 
     return WarRoomAnalysis(
-        incident_status="active",
-        executive_summary=(
-            f"Service '{req.service}' is experiencing elevated checkout errors "
-            f"(severity: {req.severity}, alert: {req.alert_name}). "
-            "Engineering is actively investigating and preparing mitigation options."
-        ),
-        customer_impact=(
-            "Customers attempting to complete purchases are receiving errors. "
-            "Checkout success rate is degraded. Revenue impact is ongoing until resolved."
-        ),
+        incident_status=incident_status,
+        executive_summary=executive_summary,
+        customer_impact=customer_impact,
         probable_root_cause=root_cause,
         confidence_percent=confidence,
         affected_systems=[req.service, "payment-gateway"],
@@ -611,34 +664,22 @@ def _war_room_fallback(req: WarRoomRequest, evidence: dict | None = None) -> War
             "Deployment version correlation pending. "
             "Compare incident start time with the most recent deployment timestamp in CI/CD."
         ),
-        recommended_actions=[
-            f"Verify {req.service} pod health and recent deployment history",
-            "Check payment gateway connectivity and timeout configuration",
-            "Review deployment changelog for changes to the checkout path",
-            "Prepare rollback to the last known-good deployment version",
-            "Monitor error rate in Grafana after any mitigation action",
-        ],
-        owner_action_items=[
-            OwnerActionItem(owner="On-call SRE",
-                            action=f"Check pod logs and rollout status for {req.service}",
-                            priority="high"),
-            OwnerActionItem(owner="Release engineer",
-                            action="Identify the last deployment and prepare rollback",
-                            priority="high"),
-            OwnerActionItem(owner="Payment team",
-                            action="Verify payment gateway health and timeout configuration",
-                            priority="high"),
-            OwnerActionItem(owner="Incident commander",
-                            action="Post status update and open stakeholder channel",
-                            priority="medium"),
-        ],
-        stakeholder_update=(
-            f"[War Room Update] Service '{req.service}' is experiencing checkout errors "
-            f"(severity: {req.severity}).{geo_note} "
-            "Engineering is investigating. Next update in 15 minutes."
+        recommended_actions=recommended_actions,
+        owner_action_items=owner_action_items,
+        stakeholder_update=stakeholder_update,
+        next_update_recommendation=next_update,
+        jira_comment=_format_war_room_jira_comment(
+            incident_status=incident_status,
+            executive_summary=executive_summary,
+            customer_impact=customer_impact,
+            probable_root_cause=root_cause,
+            confidence_percent=confidence,
+            engineering_evidence=eng_evidence,
+            recommended_actions=recommended_actions,
+            owner_action_items=owner_action_items,
+            stakeholder_update=stakeholder_update,
+            next_update_recommendation=next_update,
         ),
-        next_update_recommendation="Post next update in 15 minutes or immediately on any status change.",
-        jira_comment=jira_comment,
     )
 
 
@@ -662,7 +703,20 @@ def _call_openai_war_room(req: WarRoomRequest, evidence: dict) -> WarRoomAnalysi
         OwnerActionItem(**item) if isinstance(item, dict) else item
         for item in data.get("owner_action_items", [])
     ]
-    return WarRoomAnalysis(**data)
+    result = WarRoomAnalysis(**data)
+    result.jira_comment = _format_war_room_jira_comment(
+        incident_status=result.incident_status,
+        executive_summary=result.executive_summary,
+        customer_impact=result.customer_impact,
+        probable_root_cause=result.probable_root_cause,
+        confidence_percent=result.confidence_percent,
+        engineering_evidence=result.engineering_evidence,
+        recommended_actions=result.recommended_actions,
+        owner_action_items=result.owner_action_items,
+        stakeholder_update=result.stakeholder_update,
+        next_update_recommendation=result.next_update_recommendation,
+    )
+    return result
 
 
 # ── Monitor helpers ────────────────────────────────────────────────────────────
