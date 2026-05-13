@@ -1,5 +1,5 @@
 """
-Synthetic traffic generator for the AI Incident Commander demo.
+Synthetic traffic generator for the AI War Room Assistant demo.
 
 Sends GET /checkout requests with a fixed pool of X-Forwarded-For IPs chosen
 from multiple countries, so ClickHouse logs carry realistic client_ip diversity

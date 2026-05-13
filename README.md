@@ -1,6 +1,6 @@
-# AI Incident Commander — Checkout Service Demo
+# AI War Room Assistant — Checkout Service Demo
 
-A minimal FastAPI service used to demonstrate AI-driven incident command workflows.  
+A minimal FastAPI service used to demonstrate AI-driven war room workflows.  
 Toggle the service between **healthy** and **broken** mode at runtime to trigger real alert conditions.
 
 ---
@@ -57,7 +57,7 @@ docker compose up --build
 | Locust UI | http://localhost:8089 | — (load-test profile only) |
 
 Prometheus scrapes `/metrics` from `demo-edge-service:8000` every **5 seconds**.  
-Grafana opens at **http://localhost:3000** (admin / admin) with the **Incident Commander — Checkout Service** dashboard pre-loaded.
+Grafana opens at **http://localhost:3000** (admin / admin) with the **AI War Room Assistant — Checkout Service** dashboard pre-loaded.
 
 Dashboard panels:
 
@@ -291,7 +291,7 @@ Expected when failures are still occurring in the last 5 min:
 {
   "incident_status": "still_failing",
   "status_summary": "Incident INC-42 is still active: N failures in the last 5 minutes ...",
-  "jira_comment": "*[AI Incident Monitor — INC-42]*\n\n*Status:* Incident remains active ..."
+  "jira_comment": "*[AI War Room Assistant — INC-42]*\n\n*Status:* Incident remains active ..."
 }
 ```
 

@@ -1,6 +1,6 @@
 {
   "uid": "incident-commander",
-  "title": "Incident Commander — Checkout Service",
+  "title": "AI War Room Assistant — Checkout Service",
   "description": "Real-time request rate, 500 error rate, and p95 latency for the checkout service demo.",
   "tags": ["incident-commander"],
   "schemaVersion": 36,

@@ -563,7 +563,7 @@ def _build_jira_comment(
     lookback_label: str = "last 5 minutes",
 ) -> str:
     header = (
-        f"AI Incident Monitor \u2014 {req.jira_issue_key}\n"
+        f"AI War Room Assistant \u2014 {req.jira_issue_key}\n"
         f"\nFollow-up check: {req.follow_up_count}/{req.max_followups}\n"
     )
 
@@ -665,7 +665,7 @@ def _monitor_failed(req: MonitorRequest, reason: str) -> MonitorResponse:
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="AI Incident Analyzer",
+    title="AI War Room Assistant",
     description="Analyses Grafana alerts with live ClickHouse evidence and IPinfo enrichment to produce Jira Bug reports.",
     version="2.0.0",
     lifespan=_lifespan,

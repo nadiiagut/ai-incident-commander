@@ -38,7 +38,7 @@ REQUEST_LATENCY = Histogram(
 _healthy = True
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Checkout Service — AI Incident Commander Demo", version=DEPLOYMENT_VERSION)
+app = FastAPI(title="Checkout Service — AI War Room Assistant Demo", version=DEPLOYMENT_VERSION)
 
 
 # ── Middleware: track all requests in Prometheus ───────────────────────────────
