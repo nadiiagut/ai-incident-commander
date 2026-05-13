@@ -115,6 +115,38 @@ class MonitorResponse(BaseModel):
     )
 
 
+# ── War Room models ────────────────────────────────────────────────────────────────
+
+class WarRoomRequest(AlertPayload):
+    """Extended request body for POST /analyze-war-room."""
+
+    jira_issue_key: str = Field(default="", description="Existing Jira issue key (optional)")
+
+
+class OwnerActionItem(BaseModel):
+    owner: str = Field(..., description="Team or person responsible")
+    action: str = Field(..., description="Specific action to take")
+    priority: str = Field(default="high", description="high | medium | low")
+
+
+class WarRoomAnalysis(BaseModel):
+    """Rich structured analysis for war room sessions."""
+
+    incident_status: str = Field(..., description="active | recovering | resolved | unknown")
+    executive_summary: str = Field(..., description="2–3 sentence non-technical summary for VP/CTO")
+    customer_impact: str = Field(..., description="Customer-facing impact description")
+    probable_root_cause: str = Field(..., description="Most likely technical root cause")
+    confidence_percent: int = Field(..., ge=0, le=100, description="Root cause confidence 0–100")
+    affected_systems: list[str] = Field(..., description="Affected service and system names")
+    engineering_evidence: list[str] = Field(..., description="Key technical observations from logs")
+    regression_suspicion: str = Field(..., description="Regression assessment and change correlation")
+    recommended_actions: list[str] = Field(..., description="Ordered remediation steps for engineers")
+    owner_action_items: list[OwnerActionItem] = Field(..., description="Owner-assigned action items")
+    stakeholder_update: str = Field(..., description="Ready-to-send Slack/email update for stakeholders")
+    next_update_recommendation: str = Field(..., description="When to post the next stakeholder update")
+    jira_comment: str = Field(..., description="Ready-to-post Jira comment for war room status")
+
+
 # ── Log evidence (ClickHouse + IPinfo) ─────────────────────────────────────────────
 
 def _fetch_log_evidence(service: str) -> dict:
@@ -457,6 +489,180 @@ def _call_openai(alert: AlertPayload, evidence: dict) -> IncidentAnalysis:
     raw = completion.choices[0].message.content
     log.info("OpenAI response received (%d chars)", len(raw or ""))
     return IncidentAnalysis(**json.loads(raw))
+
+
+# ── War Room prompt + OpenAI ────────────────────────────────────────────────────
+
+_WAR_ROOM_SYSTEM_PROMPT = (
+    "You are an expert AI war room facilitator for production software incidents. "
+    "Analyse the evidence and produce a structured war room report for both engineering teams "
+    "and executive stakeholders. "
+    "Always respond with a single valid JSON object — no markdown fences, no extra text."
+)
+
+
+def _build_war_room_message(req: WarRoomRequest, evidence: dict) -> str:
+    alert_block = json.dumps({
+        "alert_name": req.alert_name,
+        "service": req.service,
+        "severity": req.severity,
+        "status": req.status,
+        "starts_at": req.starts_at,
+        "dashboard_url": req.dashboard_url,
+        "jira_issue_key": req.jira_issue_key,
+    }, indent=2)
+    evidence_block = json.dumps(evidence, indent=2)
+
+    no_data_note = ""
+    if evidence.get("no_data"):
+        no_data_note = (
+            "\nIMPORTANT: No matching log evidence found in ClickHouse. "
+            "Do NOT fabricate evidence. State clearly that no log data is available.\n"
+        )
+
+    return (
+        "Production incident in war room. Analyse the following and return ONLY a JSON object.\n\n"
+        f"## Alert\n{alert_block}\n\n"
+        f"{no_data_note}"
+        f"## Log Evidence\n{evidence_block}\n\n"
+        "## Required JSON Response Shape\n"
+        "{\n"
+        '  "incident_status": "active | recovering | resolved | unknown",\n'
+        '  "executive_summary": "2-3 non-technical sentences suitable for VP/CTO",\n'
+        '  "customer_impact": "Who is affected and how",\n'
+        '  "probable_root_cause": "Most likely technical root cause from evidence",\n'
+        '  "confidence_percent": 0-100 integer,\n'
+        '  "affected_systems": ["service-name", "dependency"],\n'
+        '  "engineering_evidence": ["observation 1 from logs", "observation 2"],\n'
+        '  "regression_suspicion": "Evidence of a recent change causing this",\n'
+        '  "recommended_actions": ["step 1", "step 2"],\n'
+        '  "owner_action_items": [{"owner": "on-call SRE", "action": "...", "priority": "high"}],\n'
+        '  "stakeholder_update": "Ready-to-send 2-3 sentence Slack/email update",\n'
+        '  "next_update_recommendation": "In 15 minutes or on status change",\n'
+        '  "jira_comment": "Plain-text Jira comment summarising war room status and next actions"\n'
+        "}\n\n"
+        "Return ONLY the JSON object. No markdown fences, no extra text."
+    )
+
+
+def _war_room_fallback(req: WarRoomRequest, evidence: dict | None = None) -> WarRoomAnalysis:
+    """Deterministic war room response for demo / no-key / LLM-error modes."""
+    ev = evidence or {}
+    has_live = ev.get("source") == "clickhouse" and not ev.get("no_data")
+
+    if has_live:
+        count = ev.get("failed_request_count", 0)
+        dominant = ev.get("dominant_error") or "unknown"
+        versions = ", ".join(ev.get("deployment_versions", [])) or "unknown"
+        eng_evidence = [
+            f"{count} failed /checkout requests since incident start",
+            f"Dominant error: {dominant}",
+            f"Deployment version(s) in window: {versions}",
+        ]
+        root_cause = (
+            f"Live evidence shows {count} /checkout failures with dominant error '{dominant}'. "
+            "Likely a downstream dependency failure or a regression in the payment gateway client."
+        )
+        confidence = 65
+    else:
+        eng_evidence = [
+            "No live ClickHouse evidence available",
+            "Assessment based on Grafana alert metadata only",
+        ]
+        root_cause = (
+            "Insufficient evidence without live log data. "
+            "Payment gateway timeout or a recent deployment regression is most likely."
+        )
+        confidence = 30
+
+    enrichment = ev.get("enrichment", {})
+    top_country = enrichment.get("top_country_name", "")
+    geo_note = f" Highest impact from {top_country}." if top_country else ""
+    ev_lines = "\n".join(f"- {e}" for e in eng_evidence)
+    action_lines = "\n".join([
+        f"- Check {req.service} pod health and recent rollout status",
+        "- Verify payment gateway connectivity and latency",
+        "- Review deployment changelog for changes to the checkout path",
+    ])
+    jira_comment = (
+        f"*[AI War Room Assistant — War Room Session]*\n\n"
+        f"*Status:* Active | *Confidence:* {confidence}%\n"
+        f"*Service:* {req.service} | *Severity:* {req.severity}\n\n"
+        f"*Engineering Evidence:*\n{ev_lines}\n\n"
+        f"*Next Actions:*\n{action_lines}"
+    )
+
+    return WarRoomAnalysis(
+        incident_status="active",
+        executive_summary=(
+            f"Service '{req.service}' is experiencing elevated checkout errors "
+            f"(severity: {req.severity}, alert: {req.alert_name}). "
+            "Engineering is actively investigating and preparing mitigation options."
+        ),
+        customer_impact=(
+            "Customers attempting to complete purchases are receiving errors. "
+            "Checkout success rate is degraded. Revenue impact is ongoing until resolved."
+        ),
+        probable_root_cause=root_cause,
+        confidence_percent=confidence,
+        affected_systems=[req.service, "payment-gateway"],
+        engineering_evidence=eng_evidence,
+        regression_suspicion=(
+            "Deployment version correlation pending. "
+            "Compare incident start time with the most recent deployment timestamp in CI/CD."
+        ),
+        recommended_actions=[
+            f"Verify {req.service} pod health and recent deployment history",
+            "Check payment gateway connectivity and timeout configuration",
+            "Review deployment changelog for changes to the checkout path",
+            "Prepare rollback to the last known-good deployment version",
+            "Monitor error rate in Grafana after any mitigation action",
+        ],
+        owner_action_items=[
+            OwnerActionItem(owner="On-call SRE",
+                            action=f"Check pod logs and rollout status for {req.service}",
+                            priority="high"),
+            OwnerActionItem(owner="Release engineer",
+                            action="Identify the last deployment and prepare rollback",
+                            priority="high"),
+            OwnerActionItem(owner="Payment team",
+                            action="Verify payment gateway health and timeout configuration",
+                            priority="high"),
+            OwnerActionItem(owner="Incident commander",
+                            action="Post status update and open stakeholder channel",
+                            priority="medium"),
+        ],
+        stakeholder_update=(
+            f"[War Room Update] Service '{req.service}' is experiencing checkout errors "
+            f"(severity: {req.severity}).{geo_note} "
+            "Engineering is investigating. Next update in 15 minutes."
+        ),
+        next_update_recommendation="Post next update in 15 minutes or immediately on any status change.",
+        jira_comment=jira_comment,
+    )
+
+
+def _call_openai_war_room(req: WarRoomRequest, evidence: dict) -> WarRoomAnalysis:
+    log.info("Calling OpenAI (war-room) model=%s alert=%s", OPENAI_MODEL, req.alert_name)
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    completion = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": _WAR_ROOM_SYSTEM_PROMPT},
+            {"role": "user",   "content": _build_war_room_message(req, evidence)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
+        timeout=30,
+    )
+    raw = completion.choices[0].message.content
+    log.info("OpenAI war-room response received (%d chars)", len(raw or ""))
+    data = json.loads(raw)
+    data["owner_action_items"] = [
+        OwnerActionItem(**item) if isinstance(item, dict) else item
+        for item in data.get("owner_action_items", [])
+    ]
+    return WarRoomAnalysis(**data)
 
 
 # ── Monitor helpers ────────────────────────────────────────────────────────────
@@ -817,6 +1023,42 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
         workflow_action=workflow_action,
         should_continue_monitoring=should_continue,
     )
+
+
+# ── War Room endpoint ──────────────────────────────────────────────────────────────
+
+@app.post(
+    "/analyze-war-room",
+    response_model=WarRoomAnalysis,
+    summary="War room analysis — richer structured output for incident command",
+)
+def analyze_war_room(req: WarRoomRequest) -> WarRoomAnalysis:
+    log.info("War room analysis: %s | service=%s severity=%s demo_mode=%s",
+             req.alert_name, req.service, req.severity, req.demo_mode)
+
+    evidence = _fetch_log_evidence(req.service)
+    log.info(
+        "War room evidence: source=%s failed_count=%s dominant_error=%r",
+        evidence.get("source"),
+        evidence.get("failed_request_count", "n/a"),
+        evidence.get("dominant_error", "n/a"),
+    )
+
+    if req.demo_mode:
+        log.info("demo_mode=True — using war room fallback with live evidence")
+        return _war_room_fallback(req, evidence)
+
+    if not OPENAI_API_KEY:
+        log.warning("OPENAI_API_KEY not set — using war room fallback with live evidence")
+        return _war_room_fallback(req, evidence)
+
+    try:
+        result = _call_openai_war_room(req, evidence)
+        log.info("War room OpenAI analysis completed for alert: %s", req.alert_name)
+        return result
+    except Exception as exc:
+        log.error("OpenAI war-room call failed (%s) — using fallback with live evidence", exc)
+        return _war_room_fallback(req, evidence)
 
 
 # ── Evidence endpoint ────────────────────────────────────────────────────────────
