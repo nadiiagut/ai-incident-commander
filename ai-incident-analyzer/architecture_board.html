@@ -303,7 +303,19 @@
     <!-- 1 ── Locust Traffic ─────────────────────────────────────────────────── -->
     <div class="station" style="min-width:148px;max-width:165px;">
       <div class="node node-blue">
-        <span style="font-size:22px;line-height:1;display:block;">🦗</span>
+        <svg style="width:30px;height:22px;display:block;margin:0 auto;" viewBox="0 0 32 24" fill="#1d4ed8">
+          <!-- body: round head left, tapered abdomen right -->
+          <path d="M4,9 C1.5,9 1.5,14.5 4,14.5 L7,14 C12,15.5 25,14.5 30,11.5 L30,10.5 C25,8.5 12,8 7,9 Z"/>
+          <!-- antenna -->
+          <path d="M4.5,9 L2,3" fill="none" stroke="#1d4ed8" stroke-width="0.9" stroke-linecap="round"/>
+          <!-- eye -->
+          <circle cx="4" cy="11.5" r="0.9" fill="#f4f5f8"/>
+          <!-- hind leg: femur up to prominent knee, tibia down-forward -->
+          <path d="M14,14 L10,4.5" fill="none" stroke="#1d4ed8" stroke-width="1.8" stroke-linecap="round"/>
+          <path d="M10,4.5 L20,21" fill="none" stroke="#1d4ed8" stroke-width="1.4" stroke-linecap="round"/>
+          <!-- small front leg -->
+          <path d="M8,14 L6.5,18" fill="none" stroke="#1d4ed8" stroke-width="1" stroke-linecap="round"/>
+        </svg>
         <div class="node-title">Locust Traffic</div>
         <div class="node-sub">synthetic HTTP load</div>
       </div>

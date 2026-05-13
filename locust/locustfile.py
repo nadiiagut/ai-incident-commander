@@ -96,7 +96,7 @@ class NormalUser(CheckoutUser):
     """
 
     abstract = False
-    wait_time = between(0.8, 1.5)
+    wait_time = between(0.5, 2.0)
 
 
 class IncidentUser(CheckoutUser):
