@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: checkout-api
-  namespace: ai-rca-demo
+  namespace: ai-war-room-demo
   labels:
     app: checkout-api
 spec:

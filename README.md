@@ -458,12 +458,12 @@ kubectl apply -f k8s/namespace.yaml
 kubectl apply -f k8s/
 ```
 
-This creates the ConfigMap, Deployment, and Service in the `ai-rca-demo` namespace.
+This creates the ConfigMap, Deployment, and Service in the `ai-war-room-demo` namespace.
 
 ### 4. Check pods
 
 ```bash
-kubectl get pods -n ai-rca-demo
+kubectl get pods -n ai-war-room-demo
 ```
 
 Expected output once ready:
@@ -475,7 +475,7 @@ checkout-api-<hash>             1/1     Running   0          30s
 ### 5. Port-forward the service
 
 ```bash
-kubectl port-forward svc/checkout-api 8000:8000 -n ai-rca-demo
+kubectl port-forward svc/checkout-api 8000:8000 -n ai-war-room-demo
 ```
 
 ### 6. Test /health

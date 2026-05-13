@@ -1,4 +1,4 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: ai-rca-demo
+  name: ai-war-room-demo
