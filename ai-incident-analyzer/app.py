@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import pathlib
+import shutil
+import subprocess
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -662,7 +664,7 @@ def _monitor_failed(req: MonitorRequest, reason: str) -> MonitorResponse:
     )
 
 
-# ── FastAPI app ────────────────────────────────────────────────────────────────
+# ── FastAPI app ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="AI War Room Assistant",
@@ -814,6 +816,99 @@ def monitor_incident(req: MonitorRequest) -> MonitorResponse:
         evidence=evidence,
         workflow_action=workflow_action,
         should_continue_monitoring=should_continue,
+    )
+
+
+# ── Evidence endpoint ────────────────────────────────────────────────────────────
+
+@app.post(
+    "/collect-evidence",
+    response_model=KubeEvidenceBundle,
+    summary="Collect Kubernetes evidence for an incident (pods, events, logs, rollout)",
+)
+def collect_evidence(req: EvidenceRequest) -> KubeEvidenceBundle:
+    collected_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    errors: list[str] = []
+
+    if not shutil.which("kubectl"):
+        log.warning("collect-evidence: kubectl not found in PATH")
+        return KubeEvidenceBundle(
+            service=req.service, namespace=req.namespace,
+            alert_name=req.alert_name, alert_time=req.alert_time,
+            collected_at=collected_at, kubectl_available=False,
+            errors=["kubectl not found in PATH"],
+        )
+
+    log.info("collect-evidence: service=%s namespace=%s alert=%s",
+             req.service, req.namespace, req.alert_name)
+
+    # ── Pods ────────────────────────────────────────────────────────────────
+    pods_raw, err = _kubectl(
+        ["get", "pods", "-n", req.namespace, "-l", f"app={req.service}", "-o", "json"]
+    )
+    if err:
+        errors.append(f"get pods: {err}")
+        pods_raw = ""
+    pods = _summarize_pods(pods_raw)
+    recent_pod = _find_recent_pod(pods_raw)
+
+    # ── Events ──────────────────────────────────────────────────────────────
+    events_raw, err = _kubectl(
+        ["get", "events", "-n", req.namespace, "--sort-by=.lastTimestamp", "-o", "json"]
+    )
+    if err:
+        errors.append(f"get events: {err}")
+        events_raw = ""
+    events = _summarize_events(events_raw)
+
+    # ── Rollout status ────────────────────────────────────────────────────────
+    rollout_status, err = _kubectl(
+        ["rollout", "status", f"deployment/{req.service}", "-n", req.namespace, "--timeout=10s"]
+    )
+    if err:
+        errors.append(f"rollout status: {err}")
+        rollout_status = None
+
+    # ── Rollout history ───────────────────────────────────────────────────────
+    rollout_history, err = _kubectl(
+        ["rollout", "history", f"deployment/{req.service}", "-n", req.namespace]
+    )
+    if err:
+        errors.append(f"rollout history: {err}")
+        rollout_history = None
+
+    # ── Logs from most recent pod ─────────────────────────────────────────────
+    logs: str | None = None
+    if recent_pod:
+        logs_raw, err = _kubectl(
+            ["logs", recent_pod, "-n", req.namespace, "--tail=100", "--timestamps=true"]
+        )
+        if err:
+            errors.append(f"logs ({recent_pod}): {err}")
+        else:
+            logs = logs_raw or "(no log output)"
+    else:
+        errors.append("logs: no matching pod found")
+
+    log.info(
+        "collect-evidence: service=%s namespace=%s pods=%d events=%d recent_pod=%r errors=%d",
+        req.service, req.namespace, len(pods), len(events), recent_pod, len(errors),
+    )
+
+    return KubeEvidenceBundle(
+        service=req.service,
+        namespace=req.namespace,
+        alert_name=req.alert_name,
+        alert_time=req.alert_time,
+        collected_at=collected_at,
+        kubectl_available=True,
+        pods=pods,
+        events=events,
+        rollout_status=rollout_status,
+        rollout_history=rollout_history,
+        recent_pod=recent_pod,
+        logs=logs,
+        errors=errors,
     )
 
 
