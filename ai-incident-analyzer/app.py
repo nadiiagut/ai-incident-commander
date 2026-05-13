@@ -217,6 +217,59 @@ class WarRoomFollowUp(BaseModel):
     follow_up_count: int
 
 
+# ── Incident timeline models ───────────────────────────────────────────────────────
+
+class TimelineEvent(BaseModel):
+    """A single normalised event on the incident timeline."""
+
+    timestamp: str = Field(..., description="ISO 8601 UTC, used for sorting")
+    time_label: str = Field(..., description="Short display label, e.g. '12:01'")
+    source: str = Field(
+        ...,
+        description="grafana | kubernetes | rollout | application_log | war_room | monitoring | manual",
+    )
+    event_type: str = Field(..., description="e.g. alert_fired, deployment_started, pod_started")
+    description: str
+    severity: str = Field(default="info", description="info | warning | critical")
+
+
+class TimelineRequest(BaseModel):
+    """Request body for POST /build-timeline."""
+
+    service: str = Field(default="checkout-api")
+    alert_name: str = Field(default="")
+    alert_fired_at: str | None = Field(default=None, description="Grafana alert fire timestamp")
+    war_room_started_at: str | None = Field(default=None, description="AI war room analysis start timestamp")
+    incident_started_at: str | None = Field(
+        default=None, description="First log failure timestamp (first_seen from ClickHouse)"
+    )
+    latest_failure_at: str | None = Field(
+        default=None, description="Latest log failure timestamp (latest_seen from ClickHouse)"
+    )
+    dominant_error: str | None = Field(default=None)
+    kube_evidence: KubeEvidenceBundle | None = Field(
+        default=None, description="Kubernetes evidence bundle from /collect-evidence"
+    )
+    follow_up_events: list[dict] = Field(
+        default_factory=list,
+        description="[{timestamp, follow_up_count, incident_status, error_count}] from /monitor-war-room",
+    )
+    extra_events: list[dict] = Field(
+        default_factory=list,
+        description="Manual events: [{timestamp, description, source, severity, event_type}]",
+    )
+
+
+class TimelineResponse(BaseModel):
+    """Normalised incident timeline in both structured and markdown form."""
+
+    events: list[TimelineEvent]
+    markdown: str
+    event_count: int
+    time_range_start: str | None = None
+    time_range_end: str | None = None
+
+
 # ── Log evidence (ClickHouse + IPinfo) ─────────────────────────────────────────────
 
 def _fetch_log_evidence(service: str) -> dict:
@@ -994,6 +1047,239 @@ def _monitor_failed(req: MonitorRequest, reason: str) -> MonitorResponse:
     )
 
 
+# ── Timeline helpers ──────────────────────────────────────────────────────────────
+
+_SEVERITY_ICON: dict[str, str] = {"info": "ℹ", "warning": "⚠", "critical": "🔴"}
+_SOURCE_LABEL: dict[str, str] = {
+    "grafana":         "Grafana",
+    "kubernetes":      "Kubernetes",
+    "rollout":         "Rollout",
+    "application_log": "App Logs",
+    "war_room":        "War Room",
+    "monitoring":      "Monitoring",
+    "manual":          "Manual",
+}
+_INTERESTING_K8S_REASONS: dict[str, tuple[str, str]] = {
+    "BackOff":         ("warning",  "CrashLoopBackOff / image pull back-off"),
+    "OOMKilling":      ("critical", "OOMKilled"),
+    "Killing":         ("warning",  "Pod being terminated"),
+    "Unhealthy":       ("warning",  "Liveness/readiness probe failed"),
+    "Failed":          ("warning",  "Container failed"),
+    "FailedCreate":    ("critical", "ReplicaSet failed to create pod"),
+    "FailedScheduling":("warning",  "Pod scheduling failed"),
+}
+_DEPLOYMENT_K8S_REASONS: set[str] = {
+    "ScalingReplicaSet", "SuccessfulCreate", "Started", "Created", "Pulled",
+}
+
+
+def _normalize_ts_to_dt(ts: str) -> datetime | None:
+    """Parse any reasonable timestamp string to an aware UTC datetime, or None."""
+    if not ts:
+        return None
+    try:
+        s = ts.strip()
+        if " " in s and "T" not in s:
+            s = s.replace(" ", "T", 1)
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _make_tl_event(
+    dt: datetime,
+    source: str,
+    event_type: str,
+    description: str,
+    severity: str = "info",
+    multi_day: bool = False,
+) -> TimelineEvent:
+    label = dt.strftime("%b %d %H:%M") if multi_day else dt.strftime("%H:%M")
+    return TimelineEvent(
+        timestamp=dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        time_label=label,
+        source=source,
+        event_type=event_type,
+        description=description,
+        severity=severity,
+    )
+
+
+def _collect_kube_events(kube: KubeEvidenceBundle, multi_day: bool) -> list[TimelineEvent]:
+    result: list[TimelineEvent] = []
+    for ev in kube.events:
+        dt = _normalize_ts_to_dt(ev.get("last_time", ""))
+        if not dt:
+            continue
+        reason = ev.get("reason", "")
+        obj    = ev.get("object", "")
+        msg    = (ev.get("message") or "")[:120]
+        if reason in _INTERESTING_K8S_REASONS:
+            sev, label = _INTERESTING_K8S_REASONS[reason]
+            desc = f"{label} on {obj}: {msg}" if msg else f"{label} on {obj}"
+            result.append(_make_tl_event(dt, "kubernetes", f"k8s_{reason.lower()}", desc, sev, multi_day))
+        elif reason in _DEPLOYMENT_K8S_REASONS:
+            desc = f"Kubernetes: {reason} on {obj}" + (f" — {msg}" if msg else "")
+            result.append(_make_tl_event(dt, "kubernetes", f"k8s_{reason.lower()}", desc, "info", multi_day))
+    return result
+
+
+def _collect_pod_events(kube: KubeEvidenceBundle, multi_day: bool) -> list[TimelineEvent]:
+    result: list[TimelineEvent] = []
+    for pod in kube.pods:
+        dt = _normalize_ts_to_dt(pod.get("created", ""))
+        if not dt:
+            continue
+        name  = pod.get("name", "?")
+        phase = pod.get("phase", "?")
+        ready = pod.get("ready", "?")
+        desc = f"Pod {name} started (phase={phase}, ready={ready})"
+        result.append(_make_tl_event(dt, "kubernetes", "pod_started", desc, "info", multi_day))
+    return result
+
+
+def _collect_rollout_events(kube: KubeEvidenceBundle, service: str, multi_day: bool) -> list[TimelineEvent]:
+    result: list[TimelineEvent] = []
+    if not kube.rollout_history:
+        return result
+
+    revisions: list[tuple[int, str]] = []
+    for line in kube.rollout_history.strip().splitlines():
+        parts = line.strip().split(None, 1)
+        if parts and parts[0].isdigit():
+            cause = parts[1].strip() if len(parts) > 1 else "<none>"
+            revisions.append((int(parts[0]), cause))
+    if not revisions:
+        return result
+
+    pod_dts = sorted(
+        [_normalize_ts_to_dt(p.get("created", "")) for p in kube.pods
+         if _normalize_ts_to_dt(p.get("created", ""))],
+        reverse=True,
+    )
+    if not pod_dts:
+        return result
+
+    latest_rev, latest_cause = max(revisions, key=lambda r: r[0])
+    dt = pod_dts[0]
+    desc = (
+        f"Rollout revision {latest_rev}: {latest_cause}"
+        if latest_cause and latest_cause != "<none>"
+        else f"Rollout revision {latest_rev} detected ({service})"
+    )
+    result.append(_make_tl_event(dt, "rollout", "deployment_started", desc, "info", multi_day))
+    return result
+
+
+def _build_timeline_markdown(events: list[TimelineEvent], service: str, alert_name: str) -> str:
+    if not events:
+        return f"## Incident Timeline — {service}\n\nNo timeline events available."
+    title = f"## Incident Timeline — {service}"
+    if alert_name:
+        title += f" ({alert_name})"
+    lines = [title, f"\nTime range: {events[0].time_label} — {events[-1].time_label}\n"]
+    for ev in events:
+        icon = _SEVERITY_ICON.get(ev.severity, "•")
+        src  = _SOURCE_LABEL.get(ev.source, ev.source)
+        lines.append(f"`{ev.time_label}` {icon} [{src}] {ev.description}")
+    return "\n".join(lines)
+
+
+def _build_timeline(req: TimelineRequest) -> TimelineResponse:
+    raw_events: list[TimelineEvent] = []
+
+    def _add(ts: str | None, source: str, event_type: str, desc: str, sev: str = "info") -> None:
+        if not ts:
+            return
+        dt = _normalize_ts_to_dt(ts)
+        if dt:
+            raw_events.append(_make_tl_event(dt, source, event_type, desc, sev))
+
+    # 1. First log failure (incident started)
+    if req.incident_started_at:
+        err = req.dominant_error or "5xx error"
+        _add(req.incident_started_at, "application_log", "log_error_first_seen",
+             f"First {err} detected on {req.service}", "critical")
+
+    # 2. Grafana alert fired
+    if req.alert_fired_at:
+        alert_label = req.alert_name or "Grafana alert"
+        _add(req.alert_fired_at, "grafana", "alert_fired",
+             f"Grafana alert triggered: {alert_label}", "critical")
+
+    # 3. War room analysis started
+    if req.war_room_started_at:
+        _add(req.war_room_started_at, "war_room", "analysis_started",
+             f"AI War Room incident analysis started for {req.service}", "info")
+
+    # 4. Latest log failure (only if distinct from first_seen)
+    if req.latest_failure_at and req.latest_failure_at != req.incident_started_at:
+        _add(req.latest_failure_at, "application_log", "log_error_latest",
+             "Latest failure recorded in application logs", "warning")
+
+    # 5. Kubernetes evidence
+    if req.kube_evidence and req.kube_evidence.kubectl_available:
+        all_dts = [_normalize_ts_to_dt(e.get("last_time", "")) for e in req.kube_evidence.events]
+        all_dts += [_normalize_ts_to_dt(p.get("created", "")) for p in req.kube_evidence.pods]
+        valid_dts = [d for d in all_dts if d]
+        multi_day = bool(
+            valid_dts and (max(valid_dts) - min(valid_dts)).total_seconds() > 43200
+        )
+        raw_events.extend(_collect_kube_events(req.kube_evidence, multi_day))
+        raw_events.extend(_collect_pod_events(req.kube_evidence, multi_day))
+        raw_events.extend(_collect_rollout_events(req.kube_evidence, req.service, multi_day))
+
+    # 6. Follow-up monitoring events
+    for fe in req.follow_up_events:
+        dt = _normalize_ts_to_dt(fe.get("timestamp", ""))
+        if not dt:
+            continue
+        n       = fe.get("follow_up_count", "?")
+        status  = fe.get("incident_status", "?")
+        count   = fe.get("error_count")
+        desc    = f"War room follow-up #{n}: {status}"
+        if count is not None:
+            desc += f" ({count} errors in window)"
+        sev = "info" if status == "recovered" else "warning"
+        raw_events.append(_make_tl_event(dt, "monitoring", "follow_up_check", desc, sev))
+
+    # 7. Manual extra events
+    for ee in req.extra_events:
+        dt = _normalize_ts_to_dt(ee.get("timestamp", ""))
+        if not dt:
+            continue
+        raw_events.append(_make_tl_event(
+            dt,
+            ee.get("source", "manual"),
+            ee.get("event_type", "manual"),
+            ee.get("description", "Manual event"),
+            ee.get("severity", "info"),
+        ))
+
+    # Sort chronologically
+    raw_events.sort(key=lambda e: e.timestamp)
+
+    # Deduplicate exact-second events with identical descriptions
+    events: list[TimelineEvent] = []
+    for ev in raw_events:
+        if events and events[-1].timestamp[:19] == ev.timestamp[:19] and events[-1].description == ev.description:
+            continue
+        events.append(ev)
+
+    return TimelineResponse(
+        events=events,
+        markdown=_build_timeline_markdown(events, req.service, req.alert_name),
+        event_count=len(events),
+        time_range_start=events[0].timestamp if events else None,
+        time_range_end=events[-1].timestamp if events else None,
+    )
+
+
 # ── kubectl helpers ───────────────────────────────────────────────────────────────
 
 def _kubectl(args: list[str], timeout: int = 15) -> tuple[str, str | None]:
@@ -1580,6 +1866,27 @@ def monitor_war_room(req: WarRoomMonitorRequest) -> WarRoomFollowUp:
         evidence=evidence,
         follow_up_count=req.follow_up_count,
     )
+
+
+# ── Timeline endpoint ─────────────────────────────────────────────────────────────
+
+@app.post(
+    "/build-timeline",
+    response_model=TimelineResponse,
+    summary="Build a normalised chronological incident timeline from multiple evidence sources",
+)
+def build_timeline(req: TimelineRequest) -> TimelineResponse:
+    log.info(
+        "Building timeline: service=%s alert=%s kube=%s follow_ups=%d extra=%d",
+        req.service, req.alert_name or "N/A",
+        req.kube_evidence is not None,
+        len(req.follow_up_events),
+        len(req.extra_events),
+    )
+    result = _build_timeline(req)
+    log.info("Timeline built: %d events, range=%s — %s",
+             result.event_count, result.time_range_start, result.time_range_end)
+    return result
 
 
 # ── Evidence endpoint ────────────────────────────────────────────────────────────
