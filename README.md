@@ -428,3 +428,71 @@ cp .env.example .env
 | `CLICKHOUSE_USERNAME` | _(required)_ | ClickHouse user — must match `CLICKHOUSE_USER` set on the server |
 | `CLICKHOUSE_PASSWORD` | _(required)_ | ClickHouse password for the above user |
 | `IPINFO_TOKEN` | _(empty)_ | IPinfo API token — enables geographic IP enrichment |
+
+---
+
+## Run in Kubernetes
+
+Manifests are in `k8s/`. They deploy the checkout-api into the `ai-rca-demo` namespace using a locally built image.
+
+### 1. Build the Docker image
+
+```bash
+docker build -t checkout-api:local .
+```
+
+> If you use **minikube**, load the image into the cluster so it is available without a registry:
+> ```bash
+> minikube image load checkout-api:local
+> ```
+
+### 2. Create the namespace
+
+```bash
+kubectl apply -f k8s/namespace.yaml
+```
+
+### 3. Apply all manifests
+
+```bash
+kubectl apply -f k8s/
+```
+
+This creates the ConfigMap, Deployment, and Service in the `ai-rca-demo` namespace.
+
+### 4. Check pods
+
+```bash
+kubectl get pods -n ai-rca-demo
+```
+
+Expected output once ready:
+```
+NAME                            READY   STATUS    RESTARTS   AGE
+checkout-api-<hash>             1/1     Running   0          30s
+```
+
+### 5. Port-forward the service
+
+```bash
+kubectl port-forward svc/checkout-api 8000:8000 -n ai-rca-demo
+```
+
+### 6. Test /health
+
+```bash
+curl http://localhost:8000/health
+# → {"status":"ok"}
+```
+
+### 7. Test /metrics
+
+```bash
+curl http://localhost:8000/metrics
+```
+
+### Tear down
+
+```bash
+kubectl delete -f k8s/
+```

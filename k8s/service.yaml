@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout-api
+  namespace: ai-rca-demo
+  labels:
+    app: checkout-api
+spec:
+  type: ClusterIP
+  selector:
+    app: checkout-api
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP

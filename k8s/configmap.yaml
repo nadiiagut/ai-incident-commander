@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: checkout-api-config
+  namespace: ai-rca-demo
+data:
+  APP_MODE: "healthy"
+  SERVICE_NAME: "checkout-api"
+  ENVIRONMENT: "demo"
