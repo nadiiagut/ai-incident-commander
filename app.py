@@ -17,10 +17,29 @@ from prometheus_client import (
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 DEPLOYMENT_VERSION = os.getenv("DEPLOYMENT_VERSION", "1.0.0")
+APP_MODE = os.getenv("APP_MODE", "healthy")
+SLOW_RESPONSE_SECONDS = float(os.getenv("SLOW_RESPONSE_SECONDS", "2.0"))
+PAYMENT_GATEWAY_URL = os.getenv("PAYMENT_GATEWAY_URL", "")
 SERVICE_NAME = "checkout-service"
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 _log = logging.getLogger(SERVICE_NAME)
+
+_log.info("Starting %s APP_MODE=%s DEPLOYMENT_VERSION=%s", SERVICE_NAME, APP_MODE, DEPLOYMENT_VERSION)
+
+# ── Startup mode checks ─────────────────────────────────────────────────────────
+if APP_MODE == "crash":
+    _log.critical(
+        "APP_MODE=crash — simulated startup failure. "
+        "The service is configured to crash on boot for demo purposes."
+    )
+    raise SystemExit(1)
+
+if APP_MODE == "bad_config" and not PAYMENT_GATEWAY_URL:
+    _log.warning(
+        "APP_MODE=bad_config — PAYMENT_GATEWAY_URL is not set. "
+        "Checkout requests will fail at runtime."
+    )
 
 # ── Prometheus metrics ─────────────────────────────────────────────────────────
 REQUEST_COUNT = Counter(
@@ -85,7 +104,7 @@ def _log_checkout(
 # ── Routes ─────────────────────────────────────────────────────────────────────
 @app.get("/health", summary="Liveness probe")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "mode": APP_MODE}
 
 
 @app.get("/checkout", summary="Process a checkout")
@@ -97,25 +116,36 @@ def checkout(request: Request, background_tasks: BackgroundTasks):
     forwarded = request.headers.get("X-Forwarded-For", "")
     client_ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "")
 
-    if _healthy:
-        response_time_ms = int((time.perf_counter() - start) * 1000)
-        record = _log_checkout(
-            status_code=200, error=None, request_id=request_id,
-            client_ip=client_ip, method="GET", response_time_ms=response_time_ms,
+    def _ok() -> JSONResponse:
+        ms = int((time.perf_counter() - start) * 1000)
+        background_tasks.add_task(
+            clickhouse_logger.insert,
+            _log_checkout(status_code=200, error=None, request_id=request_id,
+                          client_ip=client_ip, method="GET", response_time_ms=ms),
         )
-        background_tasks.add_task(clickhouse_logger.insert, record)
         return JSONResponse(status_code=200, content={"checkout": "ok"})
 
-    response_time_ms = int((time.perf_counter() - start) * 1000)
-    record = _log_checkout(
-        status_code=500, error="payment_gateway_timeout", request_id=request_id,
-        client_ip=client_ip, method="GET", response_time_ms=response_time_ms,
-    )
-    background_tasks.add_task(clickhouse_logger.insert, record)
-    return JSONResponse(
-        status_code=500,
-        content={"error": "payment_gateway_timeout"},
-    )
+    def _fail(error: str) -> JSONResponse:
+        ms = int((time.perf_counter() - start) * 1000)
+        background_tasks.add_task(
+            clickhouse_logger.insert,
+            _log_checkout(status_code=500, error=error, request_id=request_id,
+                          client_ip=client_ip, method="GET", response_time_ms=ms),
+        )
+        return JSONResponse(status_code=500, content={"error": error})
+
+    if APP_MODE == "error_500":
+        return _fail("payment_gateway_timeout")
+
+    if APP_MODE == "slow_response":
+        time.sleep(SLOW_RESPONSE_SECONDS)
+        return _ok()
+
+    if APP_MODE == "bad_config":
+        return _fail("missing_config_PAYMENT_GATEWAY_URL")
+
+    # healthy mode — /toggle-failure still works
+    return _ok() if _healthy else _fail("payment_gateway_timeout")
 
 
 @app.post("/toggle-failure", summary="Toggle between healthy and broken mode")
@@ -123,7 +153,7 @@ def toggle_failure():
     global _healthy
     _healthy = not _healthy
     mode = "healthy" if _healthy else "broken"
-    return {"mode": mode, "healthy": _healthy}
+    return {"mode": mode, "healthy": _healthy, "app_mode": APP_MODE}
 
 
 @app.get("/metrics", summary="Prometheus metrics", include_in_schema=False)
