@@ -147,6 +147,76 @@ class WarRoomAnalysis(BaseModel):
     jira_comment: str = Field(..., description="Ready-to-post Jira comment for war room status")
 
 
+# ── kubectl evidence models ────────────────────────────────────────────────────────
+
+class EvidenceRequest(BaseModel):
+    """Request body for POST /collect-evidence."""
+
+    service: str = Field(..., description="Service / deployment name")
+    namespace: str = Field(..., description="Kubernetes namespace")
+    alert_name: str = Field(default="", description="Alert that triggered evidence collection")
+    alert_time: str = Field(default="", description="Alert fire time — ISO 8601")
+
+
+class KubeEvidenceBundle(BaseModel):
+    """Compact Kubernetes evidence bundle returned by POST /collect-evidence."""
+
+    service: str
+    namespace: str
+    alert_name: str
+    alert_time: str
+    collected_at: str
+    kubectl_available: bool
+    pods: list = Field(default_factory=list, description="Summarised pod info")
+    events: list = Field(default_factory=list, description="Last 20 namespace events")
+    rollout_status: str | None = None
+    rollout_history: str | None = None
+    recent_pod: str | None = None
+    logs: str | None = None
+    errors: list[str] = Field(default_factory=list)
+
+
+# ── War Room monitor models ────────────────────────────────────────────────────────
+
+class WarRoomMonitorRequest(BaseModel):
+    """Request body for POST /monitor-war-room."""
+
+    service: str = Field(default="checkout-api")
+    endpoint: str = Field(default="/checkout")
+    namespace: str = Field(default="ai-war-room-demo")
+    incident_started_at: str = Field(..., description="ISO 8601 incident start timestamp")
+    jira_issue_key: str = Field(..., description="Jira issue key, e.g. INC-42")
+    alert_name: str = Field(default="")
+    original_suspected_cause: str = Field(
+        default="", description="Root cause from initial war room analysis"
+    )
+    follow_up_count: int = Field(default=1, description="Current follow-up iteration (1-based)")
+    max_followups: int = Field(default=5)
+    kube_evidence: KubeEvidenceBundle | None = Field(
+        default=None, description="Optional Kubernetes evidence bundle from /collect-evidence"
+    )
+
+
+class WarRoomFollowUp(BaseModel):
+    """Rich follow-up response for POST /monitor-war-room."""
+
+    jira_issue_key: str
+    incident_status: str = Field(..., description="still_failing | recovered | monitoring_failed")
+    pod_readiness: str | None = Field(default=None, description="Pod readiness from Kubernetes evidence")
+    error_rate_summary: str = Field(..., description="Current error rate from ClickHouse")
+    cause_still_valid: str = Field(..., description="Assessment of whether original suspected cause holds")
+    stakeholder_summary: str = Field(..., description="Updated message for Slack/email")
+    recommended_next_step: str = Field(..., description="What engineering should do next")
+    jira_comment: str = Field(..., description="Follow-up update or final recovery summary for Jira")
+    should_continue_monitoring: bool
+    workflow_action: str = Field(
+        ...,
+        description="continue_monitoring | stop_recovered | stop_max_followups | stop_monitoring_failed",
+    )
+    evidence: MonitorEvidence
+    follow_up_count: int
+
+
 # ── Log evidence (ClickHouse + IPinfo) ─────────────────────────────────────────────
 
 def _fetch_log_evidence(service: str) -> dict:
@@ -924,6 +994,231 @@ def _monitor_failed(req: MonitorRequest, reason: str) -> MonitorResponse:
     )
 
 
+# ── kubectl helpers ───────────────────────────────────────────────────────────────
+
+def _kubectl(args: list[str], timeout: int = 15) -> tuple[str, str | None]:
+    """Run a kubectl sub-command. Returns (stdout, error_message | None)."""
+    try:
+        result = subprocess.run(
+            ["kubectl"] + args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            return "", result.stderr.strip() or f"kubectl exited {result.returncode}"
+        return result.stdout.strip(), None
+    except FileNotFoundError:
+        return "", "kubectl not found in PATH"
+    except subprocess.TimeoutExpired:
+        return "", f"kubectl timed out after {timeout}s"
+    except Exception as exc:
+        return "", str(exc)
+
+
+def _summarize_pods(pods_json: str) -> list[dict]:
+    """Compact pod summary from kubectl get pods -o json output."""
+    try:
+        items = json.loads(pods_json).get("items", [])
+        result = []
+        for item in items:
+            meta = item.get("metadata", {})
+            status = item.get("status", {})
+            cstats = status.get("containerStatuses", [])
+            ready = sum(1 for c in cstats if c.get("ready", False))
+            result.append({
+                "name": meta.get("name", ""),
+                "phase": status.get("phase", ""),
+                "ready": f"{ready}/{len(cstats)}",
+                "node": item.get("spec", {}).get("nodeName", ""),
+                "created": meta.get("creationTimestamp", ""),
+            })
+        return result
+    except Exception:
+        return []
+
+
+def _find_recent_pod(pods_json: str) -> str | None:
+    """Return the most recently created Running pod name, or any pod if none are Running."""
+    try:
+        items = json.loads(pods_json).get("items", [])
+        running = [p for p in items if p.get("status", {}).get("phase") == "Running"]
+        candidates = running or items
+        if not candidates:
+            return None
+        newest = sorted(
+            candidates,
+            key=lambda p: p.get("metadata", {}).get("creationTimestamp", ""),
+            reverse=True,
+        )
+        return newest[0]["metadata"]["name"]
+    except Exception:
+        return None
+
+
+def _summarize_events(events_json: str) -> list[dict]:
+    """Compact event summary from kubectl get events -o json, last 20 entries."""
+    try:
+        items = json.loads(events_json).get("items", [])
+        result = []
+        for item in items:
+            result.append({
+                "type": item.get("type", ""),
+                "reason": item.get("reason", ""),
+                "object": item.get("involvedObject", {}).get("name", ""),
+                "message": (item.get("message") or "")[:200],
+                "count": item.get("count", 1),
+                "last_time": item.get("lastTimestamp") or item.get("eventTime", ""),
+            })
+        return result[-20:]
+    except Exception:
+        return []
+
+
+# ── War Room monitor helpers ───────────────────────────────────────────────────────
+
+def _extract_pod_readiness(kube: KubeEvidenceBundle | None) -> str | None:
+    """Summarise pod readiness from a KubeEvidenceBundle, or None if unavailable."""
+    if not kube or not kube.kubectl_available or not kube.pods:
+        return None
+    parts = []
+    for pod in kube.pods:
+        name = pod.get("name", "?")
+        phase = pod.get("phase", "?")
+        ready = pod.get("ready", "?")
+        parts.append(f"{name}: {phase} ({ready} ready)")
+    return "; ".join(parts) if parts else "No pods found"
+
+
+def _assess_cause_validity(
+    original_cause: str,
+    current_dominant_error: str,
+    still_failing: bool,
+) -> str:
+    """Compare original suspected cause against the current dominant error."""
+    if not still_failing:
+        return "Incident has recovered — original cause assessment no longer critical."
+    if not original_cause:
+        return "No original cause specified for comparison."
+    if current_dominant_error and current_dominant_error.lower() in original_cause.lower():
+        return (
+            f"Still valid: dominant error '{current_dominant_error}' "
+            "matches the original suspected cause. No significant change in failure pattern."
+        )
+    if current_dominant_error:
+        return (
+            f"Potentially updated: current dominant error is '{current_dominant_error}', "
+            "which may differ from the originally suspected cause. Consider re-evaluating."
+        )
+    return "Unable to assess — no error data available in current monitoring window."
+
+
+def _format_war_room_followup_comment(
+    follow_up_count: int,
+    incident_status: str,
+    pod_readiness: str | None,
+    error_rate_summary: str,
+    cause_still_valid: str,
+    stakeholder_summary: str,
+    recommended_next_step: str,
+) -> str:
+    pod_section = pod_readiness or "Kubernetes evidence not available"
+    return (
+        f"AI War Room Assistant \u2014 Follow-up Update #{follow_up_count}\n\n"
+        f"Status:\n{incident_status}\n\n"
+        f"Pod readiness:\n{pod_section}\n\n"
+        f"Current error rate:\n{error_rate_summary}\n\n"
+        f"Root cause assessment:\n{cause_still_valid}\n\n"
+        f"Stakeholder update:\n{stakeholder_summary}\n\n"
+        f"Recommended next step:\n{recommended_next_step}"
+    )
+
+
+def _format_recovery_comment(
+    jira_issue_key: str,
+    alert_name: str,
+    service: str,
+    incident_started_at: str,
+    recovered_at: str,
+    original_suspected_cause: str,
+    total_failed: int,
+    latest_failed: str,
+    lookback_label: str,
+    follow_up_count: int,
+) -> str:
+    try:
+        start_str = incident_started_at.rstrip("Z").replace("T", " ")
+        end_str = recovered_at.rstrip("Z").replace("T", " ")
+        secs = int((datetime.fromisoformat(end_str) - datetime.fromisoformat(start_str)).total_seconds())
+        if secs < 60:
+            duration = f"{secs}s"
+        elif secs < 3600:
+            duration = f"{secs // 60}m {secs % 60}s"
+        else:
+            hours, rem = divmod(secs, 3600)
+            duration = f"{hours}h {rem // 60}m"
+    except Exception:
+        duration = "unknown"
+
+    cause_section = original_suspected_cause or "Not specified"
+    checks = f"{follow_up_count} follow-up check{'s' if follow_up_count != 1 else ''}"
+    return (
+        f"AI War Room Assistant \u2014 Recovery Confirmed\n\n"
+        f"Incident: {jira_issue_key}\n"
+        f"Service: {service}\n"
+        f"Recovered at: {recovered_at}\n"
+        f"Incident duration: {duration}\n"
+        f"Follow-up checks completed: {follow_up_count}\n\n"
+        f"Recovery summary:\n"
+        f"No failed requests detected in the {lookback_label}. "
+        f"Service '{service}' has returned to normal operation.\n\n"
+        f"Original suspected cause:\n{cause_section}\n\n"
+        f"Evidence at recovery:\n"
+        f"- Total failed requests since incident start: {total_failed}\n"
+        f"- Last failure observed: {latest_failed or 'N/A'}\n"
+        f"- Failed requests in last monitoring window: 0\n\n"
+        f"Automated monitoring confirmed recovery after {checks}. "
+        "Please verify with the team and close the incident if appropriate."
+    )
+
+
+def _war_room_monitor_failed(req: WarRoomMonitorRequest, reason: str) -> WarRoomFollowUp:
+    log.warning("War room monitor failed for %s: %s", req.jira_issue_key, reason)
+    _empty_ev = MonitorEvidence(
+        total_failed_requests_since_incident_start=0,
+        failed_requests_last_5m=0,
+        first_seen="",
+        latest_failed_request="",
+        dominant_error="",
+        top_country="",
+        top_asn="",
+        follow_up_count=req.follow_up_count,
+    )
+    return WarRoomFollowUp(
+        jira_issue_key=req.jira_issue_key,
+        incident_status="monitoring_failed",
+        pod_readiness=_extract_pod_readiness(req.kube_evidence),
+        error_rate_summary=f"Monitoring failed: {reason}",
+        cause_still_valid="Unable to assess — monitoring infrastructure error.",
+        stakeholder_summary=(
+            f"[War Room Update] Automated monitoring check #{req.follow_up_count} "
+            f"could not complete ({reason}). Manual review required."
+        ),
+        recommended_next_step=(
+            "Investigate monitoring infrastructure and perform a manual incident assessment."
+        ),
+        jira_comment=(
+            f"AI War Room Assistant \u2014 Monitoring Check Failed\n\n"
+            f"Follow-up #{req.follow_up_count} could not complete: {reason}\n"
+            "Manual review is required."
+        ),
+        should_continue_monitoring=False,
+        workflow_action="stop_monitoring_failed",
+        evidence=_empty_ev,
+        follow_up_count=req.follow_up_count,
+    )
+
+
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -1113,6 +1408,178 @@ def analyze_war_room(req: WarRoomRequest) -> WarRoomAnalysis:
     except Exception as exc:
         log.error("OpenAI war-room call failed (%s) — using fallback with live evidence", exc)
         return _war_room_fallback(req, evidence)
+
+
+# ── War Room monitor endpoint ─────────────────────────────────────────────────────
+
+@app.post(
+    "/monitor-war-room",
+    response_model=WarRoomFollowUp,
+    summary="War room follow-up check — pod readiness, cause validity, error rate, recovery summary",
+)
+def monitor_war_room(req: WarRoomMonitorRequest) -> WarRoomFollowUp:
+    log.info("War room monitor: %s | service=%s follow_up=%d/%d",
+             req.jira_issue_key, req.service, req.follow_up_count, req.max_followups)
+
+    if not CLICKHOUSE_URL:
+        return _war_room_monitor_failed(req, "CLICKHOUSE_URL not configured")
+
+    try:
+        since_ts = _parse_ts(req.incident_started_at)
+    except Exception as exc:
+        return _war_room_monitor_failed(req, f"Invalid incident_started_at: {exc}")
+
+    since_expr = f"toDateTime64('{since_ts}', 3, 'UTC')"
+    full_ev = clickhouse_client.fetch_since(
+        CLICKHOUSE_URL, CLICKHOUSE_DATABASE, CLICKHOUSE_TABLE, req.endpoint, since_expr,
+        CLICKHOUSE_USERNAME, CLICKHOUSE_PASSWORD,
+    )
+    if full_ev is None:
+        return _war_room_monitor_failed(req, "ClickHouse query failed (full window)")
+
+    lookback_label = _format_lookback_label(MONITOR_LOOKBACK_SECONDS)
+    recent_expr = f"now() - INTERVAL {MONITOR_LOOKBACK_SECONDS} SECOND"
+    recent_ev = clickhouse_client.fetch_since(
+        CLICKHOUSE_URL, CLICKHOUSE_DATABASE, CLICKHOUSE_TABLE,
+        req.endpoint, recent_expr,
+        CLICKHOUSE_USERNAME, CLICKHOUSE_PASSWORD,
+    )
+    if recent_ev is None:
+        return _war_room_monitor_failed(req, "ClickHouse query failed (recent window)")
+
+    total_failed = 0 if full_ev.get("no_data") else full_ev["failed_request_count"]
+    last_window = 0 if recent_ev.get("no_data") else recent_ev["failed_request_count"]
+    latest_ts = "" if full_ev.get("no_data") else full_ev.get("latest_seen", "")
+    dominant_error = "" if full_ev.get("no_data") else full_ev.get("dominant_error", "")
+    first_seen = "" if full_ev.get("no_data") else full_ev.get("first_seen", "")
+
+    enrich_summary: dict | None = None
+    top_country = ""
+    top_asn = ""
+    if not full_ev.get("no_data") and full_ev.get("unique_ips"):
+        raw = ipinfo_client.enrich_ips(full_ev["unique_ips"][:20], IPINFO_TOKEN)
+        if raw:
+            enrich_summary = ipinfo_client.summarize_enrichment(full_ev["ip_counts"], raw)
+            top_country = enrich_summary.get("top_country_name") or ""
+            top_asn = enrich_summary.get("top_affected_asn", "")
+
+    # ── Decision ─────────────────────────────────────────────────────────────
+    if last_window == 0:
+        incident_status = "recovered"
+        workflow_action = "stop_recovered"
+        should_continue = False
+    elif req.follow_up_count >= req.max_followups:
+        incident_status = "still_failing"
+        workflow_action = "stop_max_followups"
+        should_continue = False
+    else:
+        incident_status = "still_failing"
+        workflow_action = "continue_monitoring"
+        should_continue = True
+
+    evidence = MonitorEvidence(
+        total_failed_requests_since_incident_start=total_failed,
+        failed_requests_last_5m=last_window,
+        first_seen=first_seen,
+        latest_failed_request=latest_ts,
+        dominant_error=dominant_error,
+        top_country=top_country,
+        top_asn=top_asn,
+        follow_up_count=req.follow_up_count,
+        impact_pattern=(enrich_summary or {}).get("impact_pattern", ""),
+    )
+
+    # ── Kubernetes pod readiness ──────────────────────────────────────────────
+    pod_readiness = _extract_pod_readiness(req.kube_evidence)
+
+    # ── Error rate summary ────────────────────────────────────────────────────
+    if last_window == 0:
+        error_rate_summary = f"0 failures in the {lookback_label} — no active errors detected."
+    else:
+        error_rate_summary = (
+            f"{last_window} failed request{'s' if last_window != 1 else ''} in the {lookback_label}. "
+            f"Total since incident start: {total_failed}."
+        )
+        if dominant_error:
+            error_rate_summary += f" Dominant error: {dominant_error}."
+
+    # ── Cause validity ────────────────────────────────────────────────────────
+    cause_still_valid = _assess_cause_validity(
+        req.original_suspected_cause, dominant_error, incident_status != "recovered"
+    )
+
+    recovered_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    geo_note = f" Impact highest from {top_country}." if top_country else ""
+
+    # ── Per-status: comment, summary, next step ───────────────────────────────
+    if incident_status == "recovered":
+        stakeholder_summary = (
+            f"[War Room Update] Good news \u2014 service '{req.service}' has recovered. "
+            f"No failures detected in the {lookback_label}. "
+            "Engineering is confirming and will close the incident shortly."
+        )
+        recommended_next_step = (
+            "Confirm recovery with the on-call engineer, post a final status update to stakeholders, "
+            "and close the Jira incident ticket."
+        )
+        jira_comment = _format_recovery_comment(
+            jira_issue_key=req.jira_issue_key,
+            alert_name=req.alert_name,
+            service=req.service,
+            incident_started_at=req.incident_started_at,
+            recovered_at=recovered_at,
+            original_suspected_cause=req.original_suspected_cause,
+            total_failed=total_failed,
+            latest_failed=latest_ts,
+            lookback_label=lookback_label,
+            follow_up_count=req.follow_up_count,
+        )
+    else:
+        stakeholder_summary = (
+            f"[War Room Update] Service '{req.service}' is still experiencing errors "
+            f"({last_window} failure{'s' if last_window != 1 else ''} in the {lookback_label}).{geo_note} "
+            "Engineering is actively investigating. Next update in 15 minutes."
+        )
+        if workflow_action == "stop_max_followups":
+            recommended_next_step = (
+                "Maximum follow-up count reached. Escalate to senior engineering leadership, "
+                "consider an emergency change freeze, and schedule a manual incident review."
+            )
+        else:
+            recommended_next_step = (
+                f"Continue monitoring. Investigate '{dominant_error or 'current errors'}' \u2014 "
+                f"review recent deployments and check {req.service} dependency health."
+            )
+        jira_comment = _format_war_room_followup_comment(
+            follow_up_count=req.follow_up_count,
+            incident_status=incident_status,
+            pod_readiness=pod_readiness,
+            error_rate_summary=error_rate_summary,
+            cause_still_valid=cause_still_valid,
+            stakeholder_summary=stakeholder_summary,
+            recommended_next_step=recommended_next_step,
+        )
+
+    log.info(
+        "War room monitor: %s status=%s last_window=%d total=%d follow_up=%d/%d pod_readiness=%r",
+        req.jira_issue_key, incident_status, last_window, total_failed,
+        req.follow_up_count, req.max_followups, pod_readiness,
+    )
+
+    return WarRoomFollowUp(
+        jira_issue_key=req.jira_issue_key,
+        incident_status=incident_status,
+        pod_readiness=pod_readiness,
+        error_rate_summary=error_rate_summary,
+        cause_still_valid=cause_still_valid,
+        stakeholder_summary=stakeholder_summary,
+        recommended_next_step=recommended_next_step,
+        jira_comment=jira_comment,
+        should_continue_monitoring=should_continue,
+        workflow_action=workflow_action,
+        evidence=evidence,
+        follow_up_count=req.follow_up_count,
+    )
 
 
 # ── Evidence endpoint ────────────────────────────────────────────────────────────
