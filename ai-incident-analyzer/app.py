@@ -310,6 +310,76 @@ class CommunicationBundle(BaseModel):
     )
 
 
+# ── Action tracking models ────────────────────────────────────────────────────────
+
+class ActionItem(BaseModel):
+    """A single tracked incident action item — persists across follow-up loops."""
+
+    action_id: str = Field(..., description="Stable ID across updates, e.g. 'a1'")
+    description: str
+    owner: str = Field(default="", description="Assigned owner or team")
+    status: str = Field(
+        default="proposed",
+        description="proposed | in_progress | completed | blocked | skipped",
+    )
+    mitigation_action: bool = Field(default=False, description="Part of mitigation track")
+    rollback_action: bool = Field(default=False, description="Part of rollback track")
+    monitoring_action: bool = Field(default=False, description="Part of monitoring track")
+    created_at: str = Field(default="", description="ISO 8601")
+    updated_at: str = Field(default="", description="ISO 8601")
+    notes: str = Field(default="", description="Free-form progress notes")
+
+
+class ActionTrackingRequest(BaseModel):
+    """Request body for POST /track-actions.
+
+    Pass the ``actions`` list from the previous response back unchanged to
+    persist state across follow-up monitoring loops.
+    """
+
+    jira_issue_key: str = Field(..., description="Jira issue key, e.g. INC-42")
+    service: str = Field(default="checkout-api")
+    incident_status: str = Field(default="active", description="active | recovered")
+    actions: list[ActionItem] = Field(
+        default_factory=list,
+        description="Current action state from the previous /track-actions response",
+    )
+    proposed_new_actions: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "New actions to add: [{description, owner?, mitigation_action?, "
+            "rollback_action?, monitoring_action?, notes?}]"
+        ),
+    )
+    action_updates: list[dict] = Field(
+        default_factory=list,
+        description="Status changes: [{action_id, status?, owner?, notes?}]",
+    )
+
+
+class ActionTrackingResponse(BaseModel):
+    """Full action tracking snapshot — pass ``actions`` back into the next request."""
+
+    jira_issue_key: str
+    actions: list[ActionItem] = Field(
+        ..., description="Full updated list — pass back to next /track-actions call to persist"
+    )
+    action_summary: str
+    pending_actions: list[ActionItem]
+    completed_actions: list[ActionItem]
+    next_recommended_action: str
+    mitigation_status: str = Field(
+        ..., description="not_applicable | not_started | in_progress | completed | blocked"
+    )
+    rollback_status: str = Field(
+        ..., description="not_applicable | not_started | in_progress | completed | blocked"
+    )
+    monitoring_status: str = Field(
+        ..., description="not_applicable | not_started | active | completed"
+    )
+    last_updated_at: str
+
+
 # ── Log evidence (ClickHouse + IPinfo) ─────────────────────────────────────────────
 
 def _fetch_log_evidence(service: str) -> dict:
@@ -1453,6 +1523,153 @@ def _call_openai_comms(req: CommunicationRequest) -> CommunicationBundle:
     return CommunicationBundle(**json.loads(raw))
 
 
+# ── Action tracking helpers ───────────────────────────────────────────────────────
+
+def _next_action_id(existing: list[ActionItem]) -> str:
+    """Increment past the highest numeric action ID in the list."""
+    nums: list[int] = []
+    for a in existing:
+        tail = a.action_id.lstrip("a")
+        if tail.isdigit():
+            nums.append(int(tail))
+    return f"a{max(nums, default=0) + 1}"
+
+
+def _category_status(actions: list[ActionItem]) -> str:
+    """Aggregate status for a typed subset (mitigation / rollback / monitoring)."""
+    if not actions:
+        return "not_applicable"
+    statuses = {a.status for a in actions}
+    terminal = {"completed", "skipped"}
+    if statuses <= terminal:
+        return "completed"
+    if "blocked" in statuses:
+        return "blocked"
+    if "in_progress" in statuses or (statuses & terminal and "proposed" in statuses):
+        return "in_progress"
+    return "not_started"
+
+
+def _monitoring_category_status(actions: list[ActionItem]) -> str:
+    base = _category_status(actions)
+    return "active" if base == "in_progress" else base
+
+
+def _build_action_summary(
+    jira_issue_key: str,
+    service: str,
+    actions: list[ActionItem],
+    mitigation_status: str,
+    rollback_status: str,
+    monitoring_status: str,
+) -> str:
+    counts: dict[str, int] = {}
+    for a in actions:
+        counts[a.status] = counts.get(a.status, 0) + 1
+    return (
+        f"Action tracking for {jira_issue_key} | Service: {service}\n"
+        f"Total: {len(actions)} | "
+        f"Completed: {counts.get('completed', 0)} | "
+        f"In progress: {counts.get('in_progress', 0)} | "
+        f"Pending: {counts.get('proposed', 0)} | "
+        f"Blocked: {counts.get('blocked', 0)} | "
+        f"Skipped: {counts.get('skipped', 0)}\n"
+        f"Mitigation: {mitigation_status} | "
+        f"Rollback: {rollback_status} | "
+        f"Monitoring: {monitoring_status}"
+    )
+
+
+def _next_recommended(
+    pending: list[ActionItem], in_progress: list[ActionItem]
+) -> str:
+    if in_progress:
+        a = in_progress[0]
+        suffix = f" (owner: {a.owner})" if a.owner else ""
+        return f"Continue in-progress: {a.description}{suffix}"
+    if pending:
+        a = pending[0]
+        suffix = f" — assign to: {a.owner}" if a.owner else ""
+        return f"Start next: {a.description}{suffix}"
+    return "All tracked actions completed. Verify incident resolution and close the ticket."
+
+
+def _update_action_tracking(req: ActionTrackingRequest) -> ActionTrackingResponse:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Build mutable index preserving insertion order
+    index: dict[str, ActionItem] = {a.action_id: a.model_copy() for a in req.actions}
+
+    # Apply updates to existing actions
+    for upd in req.action_updates:
+        aid = upd.get("action_id", "")
+        if aid not in index:
+            log.warning("action_update references unknown action_id=%r — skipping", aid)
+            continue
+        item = index[aid]
+        if "status" in upd:
+            item.status = upd["status"]
+        if "owner" in upd:
+            item.owner = upd["owner"]
+        if "notes" in upd:
+            item.notes = upd["notes"]
+        item.updated_at = now
+
+    # Append proposed new actions
+    for new_a in req.proposed_new_actions:
+        desc = (new_a.get("description") or "").strip()
+        if not desc:
+            continue
+        aid = _next_action_id(list(index.values()))
+        index[aid] = ActionItem(
+            action_id=aid,
+            description=desc,
+            owner=new_a.get("owner", ""),
+            status="proposed",
+            mitigation_action=bool(new_a.get("mitigation_action", False)),
+            rollback_action=bool(new_a.get("rollback_action", False)),
+            monitoring_action=bool(new_a.get("monitoring_action", False)),
+            created_at=now,
+            updated_at=now,
+            notes=new_a.get("notes", ""),
+        )
+
+    actions = list(index.values())
+
+    pending     = [a for a in actions if a.status == "proposed"]
+    in_progress = [a for a in actions if a.status == "in_progress"]
+    completed   = [a for a in actions if a.status in ("completed", "skipped")]
+    blocked     = [a for a in actions if a.status == "blocked"]
+
+    mitigation_status = _category_status([a for a in actions if a.mitigation_action])
+    rollback_status   = _category_status([a for a in actions if a.rollback_action])
+    monitoring_status = _monitoring_category_status([a for a in actions if a.monitoring_action])
+
+    log.info(
+        "Action tracking: %s | total=%d pending=%d in_progress=%d "
+        "completed=%d blocked=%d mit=%s roll=%s mon=%s",
+        req.jira_issue_key, len(actions), len(pending), len(in_progress),
+        len(completed), len(blocked),
+        mitigation_status, rollback_status, monitoring_status,
+    )
+
+    return ActionTrackingResponse(
+        jira_issue_key=req.jira_issue_key,
+        actions=actions,
+        action_summary=_build_action_summary(
+            req.jira_issue_key, req.service, actions,
+            mitigation_status, rollback_status, monitoring_status,
+        ),
+        pending_actions=pending,
+        completed_actions=completed,
+        next_recommended_action=_next_recommended(pending, in_progress),
+        mitigation_status=mitigation_status,
+        rollback_status=rollback_status,
+        monitoring_status=monitoring_status,
+        last_updated_at=now,
+    )
+
+
 # ── kubectl helpers ───────────────────────────────────────────────────────────────
 
 def _kubectl(args: list[str], timeout: int = 15) -> tuple[str, str | None]:
@@ -1895,6 +2112,23 @@ def generate_comms(req: CommunicationRequest) -> CommunicationBundle:
     except Exception as exc:
         log.error("OpenAI comms call failed (%s) — using fallback", exc)
         return _comms_fallback(req)
+
+
+# ── Action tracking endpoint ──────────────────────────────────────────────────────
+
+@app.post(
+    "/track-actions",
+    response_model=ActionTrackingResponse,
+    summary="Track incident actions with status updates across follow-up monitoring loops",
+)
+def track_actions(req: ActionTrackingRequest) -> ActionTrackingResponse:
+    log.info(
+        "Action tracking: %s | service=%s incident_status=%s "
+        "existing=%d new=%d updates=%d",
+        req.jira_issue_key, req.service, req.incident_status,
+        len(req.actions), len(req.proposed_new_actions), len(req.action_updates),
+    )
+    return _update_action_tracking(req)
 
 
 # ── War Room monitor endpoint ─────────────────────────────────────────────────────
