@@ -270,6 +270,46 @@ class TimelineResponse(BaseModel):
     time_range_end: str | None = None
 
 
+# ── Communications models ─────────────────────────────────────────────────────────
+
+class CommunicationRequest(BaseModel):
+    """Request body for POST /generate-comms."""
+
+    service: str = Field(default="checkout-api")
+    alert_name: str = Field(default="")
+    severity: str = Field(default="critical")
+    incident_status: str = Field(default="active")
+    jira_issue_key: str = Field(default="")
+    probable_root_cause: str = Field(default="")
+    customer_impact: str = Field(default="")
+    affected_systems: list[str] = Field(default_factory=list)
+    engineering_evidence: list[str] = Field(default_factory=list)
+    recommended_actions: list[str] = Field(default_factory=list)
+    confidence_percent: int = Field(default=0)
+    regression_suspicion: str = Field(default="")
+    demo_mode: bool = Field(default=False)
+
+
+class CommunicationBundle(BaseModel):
+    """Multi-audience incident communications bundle."""
+
+    engineering_summary: str = Field(
+        ..., description="Technical, detailed, operational summary for the engineering team"
+    )
+    executive_summary: str = Field(
+        ..., description="Business-impact focused, concise, no low-level technical details"
+    )
+    customer_safe_summary: str = Field(
+        ..., description="Non-sensitive, no internal infrastructure details, suitable for external comms"
+    )
+    slack_update: str = Field(
+        ..., description="Short operational status update for a Slack incidents channel"
+    )
+    jira_update: str = Field(
+        ..., description="Plain-text Jira comment with status, evidence, and next actions"
+    )
+
+
 # ── Log evidence (ClickHouse + IPinfo) ─────────────────────────────────────────────
 
 def _fetch_log_evidence(service: str) -> dict:
@@ -1280,6 +1320,139 @@ def _build_timeline(req: TimelineRequest) -> TimelineResponse:
     )
 
 
+# ── Communications helpers ────────────────────────────────────────────────────────
+
+_COMMS_SYSTEM_PROMPT = (
+    "You are an expert incident communications specialist. "
+    "Generate audience-appropriate communications for a production software incident. "
+    "Always respond with a single valid JSON object — no markdown fences, no extra text."
+)
+
+_SEV_EMOJI: dict[str, str] = {
+    "critical": ":rotating_light:",
+    "high":     ":warning:",
+    "warning":  ":warning:",
+    "low":      ":information_source:",
+}
+
+
+def _build_comms_message(req: CommunicationRequest) -> str:
+    data = json.dumps({
+        "service":              req.service,
+        "alert_name":           req.alert_name,
+        "severity":             req.severity,
+        "incident_status":      req.incident_status,
+        "jira_issue_key":       req.jira_issue_key,
+        "probable_root_cause":  req.probable_root_cause,
+        "customer_impact":      req.customer_impact,
+        "affected_systems":     req.affected_systems,
+        "engineering_evidence": req.engineering_evidence,
+        "recommended_actions":  req.recommended_actions,
+        "confidence_percent":   req.confidence_percent,
+        "regression_suspicion": req.regression_suspicion,
+    }, indent=2)
+    return (
+        "Generate audience-appropriate incident communications from the data below.\n\n"
+        f"## Incident Data\n{data}\n\n"
+        "## Required JSON Response\n"
+        "{\n"
+        '  "engineering_summary": "Technical, detailed, operational summary for the on-call engineering team. '
+        "Include: status, probable root cause with confidence %, all engineering evidence, "
+        "affected systems, regression suspicion, and ordered recommended actions. Be specific and technical.\",\n"
+        '  "executive_summary": "Business-impact focused summary for VP/CTO. Max 3 sentences. '
+        "Focus on business impact, severity, and actions being taken. No error names, pod names, or system internals.\",\n"
+        '  "customer_safe_summary": "External-facing update for a status page or customer email. '
+        "Non-sensitive wording only. No internal service names, error codes, or infrastructure details. "
+        "Focus on what the customer experiences and that the team is actively working on resolution.\",\n"
+        '  "slack_update": "Short operational update for a Slack #incidents channel. Max 3 lines. '
+        "Use a severity emoji, service name, status, and one key action or ETA.\",\n"
+        '  "jira_update": "Plain-text Jira comment for the incident ticket. '
+        "Include: status, root cause assessment, evidence summary, affected systems, and next actions.\"\n"
+        "}\n\n"
+        "Return ONLY the JSON object. No markdown fences, no extra text."
+    )
+
+
+def _comms_fallback(req: CommunicationRequest) -> CommunicationBundle:
+    """Deterministic communications bundle for demo / no-key / LLM-error modes."""
+    status   = req.incident_status or "active"
+    sev_up   = req.severity.upper()
+    emoji    = _SEV_EMOJI.get(req.severity.lower(), ":rotating_light:")
+    ev_lines = "\n".join(f"- {e}" for e in req.engineering_evidence) or "- No engineering evidence provided"
+    act_lines = "\n".join(f"{i + 1}. {a}" for i, a in enumerate(req.recommended_actions)) or "1. Investigate service health"
+    systems  = ", ".join(req.affected_systems) or req.service
+    impact   = req.customer_impact or f"service '{req.service}' is experiencing disruption"
+    cause    = req.probable_root_cause or "Under investigation"
+    regress  = req.regression_suspicion or "None identified"
+    ticket   = f" | {req.jira_issue_key}" if req.jira_issue_key else ""
+    friendly = req.service.replace("-", " ").replace("_", " ").title()
+
+    engineering_summary = (
+        f"Incident: {req.alert_name or req.service} | Status: {status} | Severity: {sev_up}\n"
+        f"Service: {req.service} | Jira: {req.jira_issue_key or 'N/A'} | Confidence: {req.confidence_percent}%\n\n"
+        f"Probable root cause:\n{cause}\n\n"
+        f"Engineering evidence:\n{ev_lines}\n\n"
+        f"Affected systems: {systems}\n\n"
+        f"Regression suspicion:\n{regress}\n\n"
+        f"Recommended actions:\n{act_lines}"
+    )
+
+    executive_summary = (
+        f"We are experiencing a {req.severity}-severity incident on {req.service} "
+        f"(alert: {req.alert_name or req.service}, status: {status}). "
+        f"{impact.capitalize() if not impact[0].isupper() else impact} "
+        f"Our engineering team is actively investigating with {req.confidence_percent}% confidence "
+        "on the probable cause and is working to restore normal service as quickly as possible."
+    )
+
+    customer_safe_summary = (
+        f"We are currently aware of an issue affecting {friendly}. "
+        "Our team is actively investigating and working to resolve this as quickly as possible. "
+        "We apologise for any inconvenience and will provide updates as the situation develops."
+    )
+
+    slack_update = (
+        f"{emoji} *[{sev_up}] {req.alert_name or req.service}* | Status: {status}\n"
+        f"{impact.capitalize() if not impact[0].isupper() else impact}\n"
+        f"Team is actively investigating. Next update in 15 min{ticket}."
+    )
+
+    jira_update = (
+        f"AI War Room Assistant \u2014 Communications Update\n\n"
+        f"Status: {status} | Severity: {sev_up} | Confidence: {req.confidence_percent}%\n\n"
+        f"Root cause assessment:\n{cause}\n\n"
+        f"Engineering evidence:\n{ev_lines}\n\n"
+        f"Affected systems: {systems}\n\n"
+        f"Next actions:\n{act_lines}"
+    )
+
+    return CommunicationBundle(
+        engineering_summary=engineering_summary,
+        executive_summary=executive_summary,
+        customer_safe_summary=customer_safe_summary,
+        slack_update=slack_update,
+        jira_update=jira_update,
+    )
+
+
+def _call_openai_comms(req: CommunicationRequest) -> CommunicationBundle:
+    log.info("Calling OpenAI (comms) model=%s service=%s", OPENAI_MODEL, req.service)
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    completion = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": _COMMS_SYSTEM_PROMPT},
+            {"role": "user",   "content": _build_comms_message(req)},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.2,
+        timeout=30,
+    )
+    raw = completion.choices[0].message.content
+    log.info("OpenAI comms response received (%d chars)", len(raw or ""))
+    return CommunicationBundle(**json.loads(raw))
+
+
 # ── kubectl helpers ───────────────────────────────────────────────────────────────
 
 def _kubectl(args: list[str], timeout: int = 15) -> tuple[str, str | None]:
@@ -1694,6 +1867,34 @@ def analyze_war_room(req: WarRoomRequest) -> WarRoomAnalysis:
     except Exception as exc:
         log.error("OpenAI war-room call failed (%s) — using fallback with live evidence", exc)
         return _war_room_fallback(req, evidence)
+
+
+# ── Communications endpoint ───────────────────────────────────────────────────────
+
+@app.post(
+    "/generate-comms",
+    response_model=CommunicationBundle,
+    summary="Generate multi-audience incident communications (engineering / executive / customer / Slack / Jira)",
+)
+def generate_comms(req: CommunicationRequest) -> CommunicationBundle:
+    log.info("Generating comms: service=%s status=%s severity=%s demo_mode=%s",
+             req.service, req.incident_status, req.severity, req.demo_mode)
+
+    if req.demo_mode:
+        log.info("demo_mode=True — using comms fallback")
+        return _comms_fallback(req)
+
+    if not OPENAI_API_KEY:
+        log.warning("OPENAI_API_KEY not set — using comms fallback")
+        return _comms_fallback(req)
+
+    try:
+        result = _call_openai_comms(req)
+        log.info("Comms generated by OpenAI for service: %s", req.service)
+        return result
+    except Exception as exc:
+        log.error("OpenAI comms call failed (%s) — using fallback", exc)
+        return _comms_fallback(req)
 
 
 # ── War Room monitor endpoint ─────────────────────────────────────────────────────
